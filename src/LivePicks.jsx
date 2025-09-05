@@ -397,14 +397,17 @@ export default function LivePicks() {
       </header>
 
       <div
-        style={{
-          width: "100%",
-          maxWidth: 640,
-          display: "flex",
-          flexDirection: "column",
-          gap: 16,
-        }}
-      >
+  style={{
+    width: "100%",
+    maxWidth: 480,          // narrower max width
+    margin: "0 auto",       // center it
+    padding: "0 8px",       // add side padding
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  }}
+>
+
         {orderedUsers.map(([user, list]) => {
           const sorted = [...list].sort((a, b) => {
             const sa = a.pick_slot ?? 99;
@@ -417,16 +420,17 @@ export default function LivePicks() {
 
           return (
             <div
-              key={user}
-              style={{
-                width: 560,
-                margin: "0 auto",
-                background: "#ffffff",
-                border: "1px solid #e3e8f3",
-                borderRadius: 12,
-                boxShadow: "0 1px 2px rgba(16,24,40,0.04)",
-              }}
-            >
+  key={user}
+  style={{
+    width: "100%",
+    margin: "0 auto",
+    background: "#ffffff",
+    border: "1px solid #e3e8f3",
+    borderRadius: 12,
+    boxShadow: "0 1px 2px rgba(16,24,40,0.04)",
+  }}
+>
+
               {/* Name bar */}
               <div
                 style={{
@@ -445,14 +449,16 @@ export default function LivePicks() {
 
               {/* Two columns: Pick A / Pick B */}
               <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr 1fr",
-                  columnGap: 16,
-                  padding: 12,
-                  fontSize: 13,
-                }}
-              >
+  style={{
+    display: "grid",
+    gridTemplateColumns: "1fr",   // default = single column
+    rowGap: 12,
+    padding: 12,
+    fontSize: 13,
+  }}
+  className="live-picks-grid"
+>
+
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                   {renderCell(pLeft)}
                 </div>
