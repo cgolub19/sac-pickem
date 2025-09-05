@@ -422,7 +422,8 @@ export default function LivePicks() {
             <div
   key={user}
   style={{
-    width: "100%",
+    width: "100%",            // take full available width
+    maxWidth: 420,            // cap at 420px so it fits small phones
     margin: "0 auto",
     background: "#ffffff",
     border: "1px solid #e3e8f3",
@@ -430,6 +431,7 @@ export default function LivePicks() {
     boxShadow: "0 1px 2px rgba(16,24,40,0.04)",
   }}
 >
+
 
               {/* Name bar */}
               <div
@@ -451,13 +453,13 @@ export default function LivePicks() {
               <div
   style={{
     display: "grid",
-    gridTemplateColumns: "1fr",   // default = single column
-    rowGap: 12,
+    gridTemplateColumns: "1fr 1fr", // always two columns
+    columnGap: 16,
     padding: 12,
     fontSize: 13,
   }}
-  className="live-picks-grid"
 >
+
 
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                   {renderCell(pLeft)}

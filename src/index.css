@@ -11,3 +11,14 @@ code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
 }
+/* Live Picks responsive grid */
+.live-picks-grid {
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 640px) {
+  .live-picks-grid {
+    grid-template-columns: 1fr 1fr;
+    column-gap: 16px;
+  }
+}
