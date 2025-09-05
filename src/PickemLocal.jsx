@@ -1,8 +1,11 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { supabase } from "./supabaseClient";
+import SeasonScorecard from "./SeasonScorecard";
+import SeasonScorecardGrid from "./SeasonScorecardGrid";
+let GLOBAL_STANDINGS_ORDER = [];
 
-/** ================== DISPLAY WEEK LABEL ================== **/
-const DISPLAY_WEEK_LABEL = "Q1-W1";
+const ODDS_KEY = (process.env.REACT_APP_ODDS_API_KEY || "").trim();
+console.log("ODDS KEY LEN:", ODDS_KEY.length);
 
 /** ================== CONFIG ================== **/
 const CURRENT_QUARTER = "Q1";
@@ -15,30 +18,132 @@ const REVERSE_SWEEP_WINNER = 9.38;
 const REVERSE_SWEEP_LOSER = -46.88;
 
 /** ================== DB HELPERS ================== **/
-async function savePickToDB({ weekId, userId, league, team, spread, odds, bonus, pressed }) {
+async function savePickToDB({
+  weekId, userId, slot, league, team, spread, odds, bonus, pressed,
+  steal, stolen, stolenBy,
+  espnEventId, espnHome, espnAway, espnCommence
+}) {
+
+
   if (weekId == null) return { error: new Error("Missing numeric weekId") };
+
   const { data, error } = await supabase
     .from("picks")
     .upsert(
-      [
-        {
-          week_id: weekId,
-          user_id: userId,
-          league, // 'NCAA' | 'NFL'
-          team,
-          spread,
-          odds,
-          bonus: bonus || null, // combo string like "LOY+LOQ" or "LOY+DOG", or null for NONE
-          pressed: !!pressed,
-        },
-      ],
-      { onConflict: "week_id,user_id,league" } // one row per user/league/week
+      [{
+        week_id: weekId,
+        user_id: userId,
+        slot,                 // 'A' | 'B'
+        league,               // 'NCAA' | 'NFL'
+        team, spread, odds,
+        bonus: bonus || null,
+        pressed: !!pressed,
+        steal: !!steal,
+stolen: !!stolen,
+stolen_by: stolenBy ?? null,
+
+        ext_source: 'espn',
+        espn_event_id: espnEventId || null,
+        espn_home: espnHome || null,
+        espn_away: espnAway || null,
+        espn_commence: espnCommence || null,
+      }],
+      { onConflict: "week_id,user_id,slot" }
     )
+    
     .select();
+
   if (error) console.error("savePickToDB error:", error);
   else console.log("saved pick →", data);
   return { data, error };
 }
+
+// --- ESPN resolver helpers ---
+function normName(s) {
+  if (!s) return "";
+  return s
+    .toLowerCase()
+    .replace(/[’'‘`]/g, "")         // apostrophes
+    .replace(/[\.\-]/g, " ")        // punctuation
+    .replace(/\s+/g, " ")           // collapse spaces
+    .trim();
+}
+
+async function fetchEspnScoreboard(leagueKey, yyyymmdd) {
+  const url = `https://site.api.espn.com/apis/site/v2/sports/football/${leagueKey}/scoreboard?dates=${yyyymmdd}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  return r.json();
+}
+
+/**
+ * Try to find the ESPN event for a pick.
+ * Params:
+ *  - league: 'NCAA' | 'NFL'
+ *  - teamName: from your line (e.g., "Hawaii Rainbow Warriors")
+ *  - opponentName: from your line if available (optional)
+ *  - kickoffIso: ISO date/time if available (optional)
+ */
+async function resolveEspnEvent({ league, teamName, opponentName, kickoffIso }) {
+  const leagueKey = league === "NFL" ? "nfl" : "college-football";
+
+  // Build candidate dates: kickoff date (if present) ±1 day, else today ±1
+  const dates = new Set();
+  const pushDate = (d) => dates.add(d.toISOString().slice(0,10).replace(/-/g, ""));
+  if (kickoffIso) {
+    const d0 = new Date(kickoffIso);
+    const d1 = new Date(d0.getTime() - 24*60*60*1000);
+    const d2 = new Date(d0.getTime() + 24*60*60*1000);
+    [d1,d0,d2].forEach(pushDate);
+  } else {
+    const now = new Date();
+    const d1 = new Date(now.getTime() - 24*60*60*1000);
+    const d2 = new Date(now.getTime() + 24*60*60*1000);
+    [d1, now, d2].forEach(pushDate);
+  }
+
+  const target = normName(teamName);
+  const opp    = normName(opponentName || "");
+
+  for (const ymd of dates) {
+    const sb = await fetchEspnScoreboard(leagueKey, ymd);
+    if (!sb || !Array.isArray(sb.events)) continue;
+
+    for (const ev of sb.events) {
+      const comp = ev.competitions?.[0];
+      const a = comp?.competitors?.find((c) => c.homeAway === "away");
+      const h = comp?.competitors?.find((c) => c.homeAway === "home");
+      if (!a || !h) continue;
+
+      const away = a.team?.displayName || a.team?.shortDisplayName || a.team?.name;
+      const home = h.team?.displayName || h.team?.shortDisplayName || h.team?.name;
+      const nAway = normName(away);
+      const nHome = normName(home);
+
+      const teamMatches = nAway.includes(target) || nHome.includes(target);
+      if (!teamMatches) continue;
+
+      // If we know the opponent, require it too.
+      if (opp) {
+        const oppMatches = nAway.includes(opp) || nHome.includes(opp);
+        if (!oppMatches) continue;
+      }
+
+      // Found a match
+      return {
+        espnEventId: ev.id,
+        espnHome: home,
+        espnAway: away,
+        espnCommence: ev.date || comp.date || null,
+      };
+    }
+  }
+
+  // No match found
+  return { espnEventId: null, espnHome: null, espnAway: null, espnCommence: null };
+}
+
+
 
 /** ================== PLAYERS ================== **/
 function mkPlayer(id, name) {
@@ -77,6 +182,8 @@ function ensurePlayerShape(p) {
       },
   };
 }
+let CURRENT_WEEK_LABEL_FOR_USAGE = null;
+
 function recalcBonusUsage(players) {
   return players.map((p) => {
     const usage = {
@@ -90,7 +197,10 @@ function recalcBonusUsage(players) {
         const b = (obj?.[kind]?.bonus || "NONE").toUpperCase(); // combo string
         if (b.includes("LOY")) usage.LOY = true;
         if (b.includes("LOQ")) usage.LOQ[q] = true;
-        if (b.includes("DOG")) usage.DOG[q] = true;
+        if (b.includes("DOG") && wk === CURRENT_WEEK_LABEL_FOR_USAGE) usage.DOG[q] = true;
+
+
+
       }
     }
     return { ...p, bonusUsage: usage };
@@ -138,34 +248,102 @@ function TeamLogo({ name, size = 28 }) {
     </div>
   );
 }
+console.log("ODDS KEY ENDING:", (process.env.REACT_APP_ODDS_API_KEY || "").slice(-4));
+// ===== Book & market fallbacks =====
+const PREFERRED_BOOKS = ["betmgm"];
+
+
+function getBestMarketForEvent(ev, marketKey, preferredBooks = PREFERRED_BOOKS) {
+  const books = Array.isArray(ev.bookmakers) ? ev.bookmakers : [];
+  const candidates = books
+    .map(b => {
+      const m = b.markets?.find(mm => mm.key === marketKey);
+      if (!m || !m.outcomes?.length) return null;
+      const last = Date.parse(m.last_update || b.last_update || 0) || 0;
+      return { bookKey: (b.key || "").toLowerCase(), bookTitle: b.title, market: m, last };
+    })
+    .filter(Boolean);
+
+  if (!candidates.length) return null;
+
+  // Sort by (1) preferred book order, then (2) freshest update
+  candidates.sort((a, b) => {
+    const ai = preferredBooks.indexOf(a.bookKey);
+    const bi = preferredBooks.indexOf(b.bookKey);
+    const ap = ai === -1 ? 999 : ai;
+    const bp = bi === -1 ? 999 : bi;
+    if (ap !== bp) return ap - bp;
+    return b.last - a.last;
+  });
+
+  return candidates[0];
+}
+
+function pickDisplayMarket(ev) {
+  return (
+    getBestMarketForEvent(ev, "spreads") ||
+    getBestMarketForEvent(ev, "h2h") ||
+    getBestMarketForEvent(ev, "totals") ||
+    null
+  );
+}
+
+
+
 
 /** ================== ODDS NORMALIZER (short) ================== **/
-function normalizeOddsApiToGames(events = [], bookmakerKey = "betmgm") {
+function normalizeOddsApiToGames(events = []) {
   const games = [];
   for (const ev of events) {
     const group = new Date(ev.commence_time).toLocaleString(undefined, {
-      weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+      weekday: "long",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
     });
-    const bm = ev.bookmakers?.find(b => (b.key || "").toLowerCase() === bookmakerKey) || ev.bookmakers?.[0];
-    const spreads = bm?.markets?.find(m => m.key === "spreads");
-    const outcomes = spreads?.outcomes || [];
+
+    const chosen = pickDisplayMarket(ev); // prefers DK, then MGM, etc.
+    const outcomes = chosen?.market?.outcomes || [];
+
     const byTeam = {};
     for (const o of outcomes) {
-      byTeam[o.name] = { spread: Number(o.point ?? 0), odds: Number(o.price ?? -110) };
+      byTeam[o.name] = {
+        spread: Number(o.point ?? 0),   // 0 for moneyline
+        odds: Number(o.price ?? -110),
+      };
     }
-    const homeName = ev.home_team, awayName = ev.away_team;
+
+    const homeName = ev.home_team;
+    const awayName = ev.away_team;
+
     games.push({
       id: ev.id,
       group,
       commence: ev.commence_time,
-      bookmaker: bm?.key || "betmgm",
-      home: { name: homeName, spread: byTeam[homeName]?.spread ?? 0, odds: byTeam[homeName]?.odds ?? -110 },
-      away: { name: awayName, spread: byTeam[awayName]?.spread ?? 0, odds: byTeam[awayName]?.odds ?? -110 },
+      bookmaker: chosen?.bookKey || ev.bookmakers?.[0]?.key || "unknown",
+      home: {
+        name: homeName,
+        spread: byTeam[homeName]?.spread ?? 0,
+        odds: byTeam[homeName]?.odds ?? -110,
+      },
+      away: {
+        name: awayName,
+        spread: byTeam[awayName]?.spread ?? 0,
+        odds: byTeam[awayName]?.odds ?? -110,
+      },
     });
   }
-  games.sort((a, b) => new Date(a.commence) - new Date(b.commence) || a.home.name.localeCompare(b.home.name));
+
+  games.sort(
+    (a, b) =>
+      new Date(a.commence) - new Date(b.commence) ||
+      a.home.name.localeCompare(b.home.name)
+  );
   return games;
 }
+
+
 
 /** ================== SCORING HELPERS ================== **/
 function wonPoints(margin, spread) { return spread >= 0 ? margin + spread : margin - Math.abs(spread); }
@@ -286,16 +464,13 @@ function cumulativeATS(players) {
   return out;
 }
 
-/** ================== PRIORITY STEAL ORDER (seed) ================== **/
-const PRIORITY_RANK = Object.freeze({
-  joey: 1,
-  chris: 2,
-  dan: 3,
-  nick: 4,
-  kevin: 5,
-  aaron: 6,
-});
-const priorityOf = (id) => (PRIORITY_RANK[(id || "").toLowerCase()] ?? 999);
+// === Steal priority based on current overall standings ===
+const priorityOf = (id) => {
+  const pid = String(id || "").toLowerCase();
+  const idx = GLOBAL_STANDINGS_ORDER.indexOf(pid);
+  return idx === -1 ? 999 : idx; // lower index = better standing
+};
+
 
 /** ================== LADDER (token tiers) ==================
  * Tie-break index encodes your sheet:
@@ -356,10 +531,182 @@ function canTakeTeam({ attemptorId, victimId, victimBonus, chosenBonus }) {
 
 /** ================== MAIN COMPONENT ================== **/
 export default function PickemLocal() {
+ const showSeason = window.location.pathname.endsWith("/season");
+const [page, setPage] = useState("pick");
+
+
+
   // Numeric week id from DB (for saving)
-  const [currentWeekId, setCurrentWeekId] = useState(null);
-  const [weekStatus, setWeekStatus] = useState(null);
+ const [currentWeekId, setCurrentWeekId] = useState(null);
+const [weekStatus, setWeekStatus] = useState(null);
+const [weekLabel, setWeekLabel] = useState("Q1-W1");
+const [standingsOrder, setStandingsOrder] = useState([]);
+
+const DISPLAY_WEEK_LABEL = weekLabel; // <— add this line
+// === Overall standings order (for sorting the Pick'em list) ===
+
+
+useEffect(() => {
+  let mounted = true;
+  (async () => {
+    // derive quarter like "Q1" from "Q1-W2"
+    const quarter = String(weekLabel || "").split("-")[0] || "Q1";
+
+    // sum week_total per player for this quarter → same as Season Scorecard
+    const { data, error } = await supabase
+      .from("weekly_results")
+      .select("user_id, week_total, quarter")
+      .eq("quarter", quarter);
+
+    if (!mounted || error || !Array.isArray(data)) return;
+
+    const totals = {};
+    for (const r of data) {
+      const pid = (r.user_id || "").toLowerCase();
+      totals[pid] = (totals[pid] || 0) + Number(r.week_total || 0);
+    }
+
+    // order = players sorted by dollars desc
+    const order = Object.entries(totals)
+      .sort((a, b) => b[1] - a[1])
+      .map(([pid]) => pid);
+
+    if (mounted) setStandingsOrder(order);
+    GLOBAL_STANDINGS_ORDER = order;
+
+  })();
+
+  return () => { mounted = false; };
+}, [weekLabel]);
+
+
+  // holds dollars + ATS maps used by the "Overall Standings" UI
+  const [overallDollars, setOverallDollars] = useState({});
+  const [ats, setAts] = useState({});
+
+
+
 const isWeekOne = Number(currentWeekId) === 1; // special: two college picks
+  // If you don't already have CURRENT_QUARTER, this derives it from the label.
+  const CURRENT_QUARTER = (weekLabel?.split?.('-')?.[0] || 'Q1');
+
+  // Load quarter standings and normalize keys to lowercase so they match p.id
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadStandings() {
+      try {
+        const { data, error } = await supabase
+          .from('vw_quarter_standings')
+          .select('user_id,total_dollars,wins,losses,pushes')
+          .eq('quarter', CURRENT_QUARTER);
+
+        if (error) {
+          console.error('standings fetch error:', error);
+          return;
+        }
+
+        const dollarsMap = {};
+        const atsMap = {};
+
+        for (const row of (data || [])) {
+          // normalize user_id to the lowercase ids used by the UI (p.id)
+          const key = String(row.user_id || '').toLowerCase().trim();
+
+          dollarsMap[key] = Number(row.total_dollars) || 0;
+          atsMap[key] = {
+            w: Number(row.wins)   || 0,
+            l: Number(row.losses) || 0,
+            p: Number(row.pushes) || 0,
+          };
+        }
+
+        if (!cancelled) {
+          setOverallDollars(dollarsMap);
+          setAts(atsMap);
+          console.log('standings loaded', dollarsMap, atsMap);
+        }
+      } catch (e) {
+        console.error('standings load failed:', e);
+      }
+    }
+
+    loadStandings();
+    return () => { cancelled = true; };
+  }, [CURRENT_QUARTER]);
+
+useEffect(() => {
+  let mounted = true;
+
+  (async () => {
+    const { data, error } = await supabase
+      .from("vw_current_week")
+      .select("*")
+      .single();
+
+    if (error || !data || !mounted) return;
+
+    setCurrentWeekId(data.week_id);
+    setWeekStatus(data.status);
+    setWeekLabel(`${data.quarter}-${data.label}`); // e.g. "Q1-W2"
+  })();
+
+  return () => { mounted = false; };
+}, []);
+// === Overall standings (per quarter) ===
+const [standings, setStandings] = useState([]);
+
+// Helper to read a player's row safely
+const getStand = (name) =>
+  standings.find(
+    (r) => String(r.player || "").toLowerCase() === String(name || "").toLowerCase()
+  ) || { dollars: 0, ats_wins: 0, ats_losses: 0, ats_pushes: 0 };
+
+/*
+// Load whenever the week/quarter label changes (e.g., Q1-W2 -> Q1-W3)
+useEffect(() => {}, [weekLabel]);
+
+  let mounted = true;
+  (async () => {
+    // derive quarter like "Q1" from "Q1-W2"
+    const quarter = String(weekLabel || "").split("-")[0] || "Q1";
+
+    const { data, error } = await supabase
+  .from("weekly_results")
+  .select("user_id, dollars, ats_w, ats_l, ats_p, quarter")
+  .eq("quarter", quarter);
+
+
+    if (error || !mounted) return;
+    if (!data) return;
+
+// roll up totals by user_id
+const rolled = {};
+for (const row of data) {
+  if (!rolled[row.user_id]) {
+    rolled[row.user_id] = { user_id: row.user_id, dollars: 0, ats_w: 0, ats_l: 0, ats_p: 0 };
+  }
+  rolled[row.user_id].dollars += Number(row.dollars || 0);
+  rolled[row.user_id].ats_w   += Number(row.ats_w || 0);
+  rolled[row.user_id].ats_l   += Number(row.ats_l || 0);
+  rolled[row.user_id].ats_p   += Number(row.ats_p || 0);
+}
+setStandings(
+  Object.values(rolled).map((r) => ({
+    player: r.user_id,                 // display name fallback
+    dollars: Number(r.dollars || 0),
+    ats_wins: Number(r.ats_w || 0),
+    ats_losses: Number(r.ats_l || 0),
+    ats_pushes: Number(r.ats_p || 0),
+  }))
+);
+
+
+  return () => {
+    mounted = false;
+  };
+}, [weekLabel]);
+*/
 
   // TEMP: force unlocked while we finalize rules
   const locked = String(weekStatus).toUpperCase() === "LOCKED";
@@ -388,6 +735,8 @@ const isWeekOne = Number(currentWeekId) === 1; // special: two college picks
       const raw = localStorage.getItem("sac_players_v2");
       const data = raw ? JSON.parse(raw) : initialPlayers;
       const arr = Array.isArray(data) ? data : initialPlayers;
+     CURRENT_WEEK_LABEL_FOR_USAGE = DISPLAY_WEEK_LABEL;
+
       return recalcBonusUsage(arr.map(ensurePlayerShape));
     } catch { return initialPlayers; }
   });
@@ -398,7 +747,8 @@ const isWeekOne = Number(currentWeekId) === 1; // special: two college picks
     (async () => {
       const { data, error } = await supabase
         .from("picks")
-        .select("user_id, league, team, spread, odds, bonus, pressed")
+        .select("user_id, league, team, spread, odds, bonus, pressed, steal, stolen, stolen_by")
+
         .eq("week_id", currentWeekId);
       if (error) { console.error("load picks error:", error); return; }
 
@@ -419,9 +769,15 @@ const isWeekOne = Number(currentWeekId) === 1; // special: two college picks
             odds: row.odds ?? null,
             bonus: String(row.bonus || "NONE").toUpperCase(), // combo string
             pressed: !!row.pressed,
+            steal:   !!row.steal,
+stolen:  !!row.stolen,
+stolen_by: row.stolen_by || null,
+
           };
           copy[i].picks = { ...copy[i].picks, [weekKey]: week };
         }
+        CURRENT_WEEK_LABEL_FOR_USAGE = DISPLAY_WEEK_LABEL;
+
         return recalcBonusUsage(copy);
       });
       console.log("[HYDRATE DONE] rows:", data);
@@ -455,21 +811,30 @@ const [logosLoaded, setLogosLoaded] = useState(false);
       try {
         setLinesLoading(true);
         setLinesError(null);
-        const apiKey = process.env.REACT_APP_ODDS_API_KEY;
+        const apiKey = (process.env.REACT_APP_ODDS_API_KEY || "").trim();
+console.log("ODDS KEY LEN:", apiKey.length);
+
         const apiBase = process.env.REACT_APP_ODDS_API_BASE || "https://api.the-odds-api.com/v4";
         const region = process.env.REACT_APP_ODDS_REGION || "us";
-        const bookmaker = (process.env.REACT_APP_ODDS_BOOKMAKER || "betmgm").toLowerCase();
-        const markets = process.env.REACT_APP_ODDS_MARKETS || "spreads";
-        const oddsFormat = process.env.REACT_APP_ODDS_FORMAT || "american";
-        const endpoints = [
-          `${apiBase}/sports/americanfootball_ncaaf/odds?regions=${region}&bookmakers=${bookmaker}&markets=${markets}&oddsFormat=${oddsFormat}&apiKey=${apiKey}`,
-          `${apiBase}/sports/americanfootball_nfl/odds?regions=${region}&bookmakers=${bookmaker}&markets=${markets}&oddsFormat=${oddsFormat}&apiKey=${apiKey}`,
-        ];
+        const bookmakers =
+  process.env.REACT_APP_ODDS_BOOKMAKERS ||
+    "betmgm";
+
+const markets =
+  process.env.REACT_APP_ODDS_MARKETS || "spreads,totals,h2h";
+const oddsFormat = process.env.REACT_APP_ODDS_FORMAT || "american";
+
+const endpoints = [
+  `${apiBase}/sports/americanfootball_ncaaf/odds?regions=${region}&bookmakers=${bookmakers}&markets=${markets}&oddsFormat=${oddsFormat}&dateFormat=iso&apiKey=${apiKey}`,
+  `${apiBase}/sports/americanfootball_nfl/odds?regions=${region}&bookmakers=${bookmakers}&markets=${markets}&oddsFormat=${oddsFormat}&dateFormat=iso&apiKey=${apiKey}`,
+];
+
         const [cfbRes, nflRes] = await Promise.all(endpoints.map((u) => fetch(u)));
         const [cfbJson, nflJson] = await Promise.all([cfbRes.json(), nflRes.json()]);
         if (!alive) return;
-        setCollegeLines(normalizeOddsApiToGames(Array.isArray(cfbJson) ? cfbJson : [], bookmaker));
-        setNflLines(normalizeOddsApiToGames(Array.isArray(nflJson) ? nflJson : [], bookmaker));
+        setCollegeLines(normalizeOddsApiToGames(Array.isArray(cfbJson) ? cfbJson : []));
+setNflLines(normalizeOddsApiToGames(Array.isArray(nflJson) ? nflJson : []));
+
       } catch (e) {
         if (!alive) return;
         setLinesError(String(e?.message || e));
@@ -540,7 +905,11 @@ useEffect(() => {
     return parts.length ? parts.join("+") : "NONE";
   }
 
-  const onConfirmPick = ({ playerId, type, line, steal }) => {
+ const onConfirmPick = async ({ playerId, type, line, steal }) => {
+// default values for stolen flags
+const stolen = false;
+const stolenBy = null;
+
     const league = type === "college" ? "NCAA" : "NFL";
     const victimId = findOwnerOfTeam(DISPLAY_WEEK_LABEL, type, line.team);
 
@@ -606,26 +975,68 @@ useEffect(() => {
           odds: line.odds,
           bonus: saveCombo,      // combo string e.g. "LOY+LOQ", "LOY+DOG", "NONE"
           pressed: !!pressed,    // PRESS is independent
+          steal: !!steal,
+stolen: !!stolen,
+stolen_by: stolenBy || null,
+
           steal: !!steal,        // display only
         };
         nextPicks[DISPLAY_WEEK_LABEL] = wk;
         return { ...p, picks: nextPicks };
       });
+CURRENT_WEEK_LABEL_FOR_USAGE = DISPLAY_WEEK_LABEL;
 
       return recalcBonusUsage(next);
     });
 
     // save to DB with the numeric week id
-    savePickToDB({
-      weekId: currentWeekId,
-      userId: playerId,
-      league,
-      team: line.team,
-      spread: line.spread,
-      odds: line.odds ?? null,
-      bonus: saveCombo === "NONE" ? null : saveCombo,
-      pressed: !!pressed,
-    });
+// BEFORE calling savePickToDB: resolve the ESPN event for this pick
+const resolved = await resolveEspnEvent({
+  league,
+  teamName: line.team,
+  opponentName: line.opponent || null,  // ok if undefined
+  kickoffIso: line.commence || null,    // ok if undefined
+});
+
+await savePickToDB({
+  weekId: currentWeekId,
+  userId: playerId,
+  slot: (type === "college" ? "A" : "B"),
+  league,
+  team: line.team,
+  spread: line.spread,
+  odds: line.odds ?? null,
+  bonus: saveCombo === "NONE" ? null : saveCombo,
+  steal,               // already in scope here
+stolen: false,       // this row is the thief's row
+stolenBy: null,
+
+  pressed: !!pressed,
+  espnEventId: resolved.espnEventId,
+  espnHome: resolved.espnHome,
+  espnAway: resolved.espnAway,
+  espnCommence: resolved.espnCommence,
+});
+// Mark the victim's existing pick as stolen in DB
+// Mark the victim's existing pick as stolen in DB (same week + same slate)
+if (steal && victimId) {
+  const { error: markErr } = await supabase
+    .from("picks")
+    .update({ stolen: true, stolen_by: playerId })
+      .eq("week_id", currentWeekId)
+  .eq("user_id", victimId)
+  .eq("league", league)          // 'NCAA' | 'NFL'
+  .eq("team", line.team);        // <-- only the stolen team
+
+  if (markErr) {
+    console.error("Failed to mark victim pick as stolen:", markErr);
+  }
+}
+
+
+
+
+
 
     closeSelector();
   };
@@ -647,8 +1058,7 @@ useEffect(() => {
   }, [players, weekDollarsBaseMap, weekBonuses]);
 
   // Totals (still shown on the right for info)
-  const overallDollars = useMemo(() => cumulativeDollars(players), [players]);
-  const ats = useMemo(() => cumulativeATS(players), [players]);
+ 
 
   // Order used in the table (Week-1 = your seed order)
   const playersForDisplay = useMemo(() => {
@@ -676,9 +1086,26 @@ useEffect(() => {
     );
     alert("Cleared local picks in React state.");
   };
+if (page === "season") return <SeasonScorecard />;
+{page === "grid" && <SeasonScorecardGrid />}
+
 
   return (
     <>
+    <button
+ onClick={() => setPage("season")}
+
+  style={{ margin: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
+><button
+  onClick={() => (window.location.href = "/live-picks")}
+  style={{ marginLeft: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
+>
+  Go to Live Picks
+</button>
+
+  Go to Season Scorecard
+</button>
+
       <div style={topBar}>
         <div style={{ color: "#e6edf6", fontWeight: 900, letterSpacing: 1 }}>
           SAC Pick’Em
@@ -702,13 +1129,43 @@ useEffect(() => {
       </div>
 
       <div style={{ padding: 12 }}>
-        <button
-          onClick={clearLocalPicks}
-          style={{ marginLeft: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
-        >
-          Clear Local Picks
-        </button>
-      </div>
+  <button
+    onClick={clearLocalPicks}
+    style={{ marginLeft: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
+  >
+    Clear Local Picks
+  </button>
+
+  <button
+    onClick={() => setPage("season")}
+    style={{ marginLeft: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
+  >
+    Go to Season Scorecard
+  </button>
+
+  <button
+    onClick={() => setPage("grid")}
+    style={{ marginLeft: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
+  >
+    Go to Grid Scorecard
+  </button>
+
+  <button
+    onClick={() => (window.location.href = "/live-picks")}
+    style={{
+      marginLeft: 8,
+      padding: "6px 10px",
+      borderRadius: 6,
+      border: "1px solid #e5e7eb",
+      background: "#0b2a5b",
+      color: "white",
+      fontWeight: 600,
+    }}
+  >
+    Go to Live Picks
+  </button>
+</div>
+
 
       {/* Selector modal */}
       {selector && (
@@ -766,7 +1223,14 @@ useEffect(() => {
               <div style={{ fontWeight: 800, marginBottom: 6 }}>
                 Week Dollars (with bonuses)
               </div>
-              {players.map((p) => {
+              {[...players]
+  .sort((a, b) => {
+    const ia = standingsOrder.indexOf(String(a.id).toLowerCase());
+    const ib = standingsOrder.indexOf(String(b.id).toLowerCase());
+    return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+  })
+  .map((p) => {
+
                 const { dollars } = weeklyDollarsBase(players, DISPLAY_WEEK_LABEL);
                 const bonus = computeWeekBonuses(players, DISPLAY_WEEK_LABEL)[p.id]?.total || 0;
                 return (
@@ -803,7 +1267,8 @@ useEffect(() => {
   </div>
   {players.map((p) => {
     const d = overallDollars[p.id] ?? 0;
-    const r = ats[p.id] ?? { w: 0, l: 0, p: 0 };
+const r = ats[p.id] ?? { w: 0, l: 0, p: 0 };
+
     return (
       <div
         key={p.id}
@@ -815,10 +1280,18 @@ useEffect(() => {
         }}
       >
         <div>{p.name}</div>
-        <div style={{ fontWeight: 700 }}>${d.toFixed(2)}</div>
-        <div style={{ color: "#475569" }}>
-          {r.w}-{r.l}-{r.p}
-        </div>
+        <div
+  style={{
+    fontWeight: 700,
+    color: d >= 0 ? "#136f3e" : "#b42323",
+  }}
+>
+  {(d >= 0 ? "+" : "-")}${Math.abs(d).toFixed(2)}
+</div>
+<div style={{ color: "#475569" }}>
+  {r.w}-{r.l}-{r.p}
+</div>
+
       </div>
     );
   })}
@@ -1365,6 +1838,7 @@ function renderBadges(pick) {
   return <div style={{ display: "inline-flex", gap: 6, marginLeft: 8 }}>{badges}</div>;
 }
 
+
 /* ================== TABLE ================== */
 function MakePicksTable({ players, weekIdLabel, onCellClick, locked, currentUserId, isWeekOne }) {
 
@@ -1401,7 +1875,17 @@ function MakePicksTable({ players, weekIdLabel, onCellClick, locked, currentUser
   </tr>
 </thead>
           <tbody>
-            {players.map((p) => {
+            {[...players]
+  .sort((a, b) => {
+    const ia = GLOBAL_STANDINGS_ORDER.indexOf(String(a.id).toLowerCase());
+    const ib = GLOBAL_STANDINGS_ORDER.indexOf(String(b.id).toLowerCase());
+    if (ia === -1 && ib === -1) return 0;
+    return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+  })
+  
+
+  .map((p) => {
+
               const wk = (p && p.picks && weekIdLabel && p.picks[weekIdLabel]) || {};
               const col = wk.college;
               const pro = wk.pro;
@@ -1473,7 +1957,8 @@ function BonusSummaryCompact({ players, quarter }) {
     </span>
   );
 
-  return (
+return (
+
     <div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 10, background: "#fff" }}>
       <div style={{ fontWeight: 800, marginBottom: 6, fontSize: 13 }}>
         Bonus Summary — {quarter} <span style={{ fontSize: 11, color: "#64748b" }}>(red = used)</span>

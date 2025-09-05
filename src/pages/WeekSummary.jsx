@@ -180,34 +180,48 @@ export default function WeekSummary() {
   }, []);
 
   // Build page picks with real names
-  const picks = useMemo(() => {
-    const byUser = {};
-    for (const r of dbPicks) {
-      const id = r.user_id;
-      if (!byUser[id]) {
-        byUser[id] = {
-          player: DISPLAY_NAME[id] || titleCase(id),
-          selections: {},
-          bonuses: {},
-        };
-      }
-      const slot = r.league === "NCAA" ? "C1" : "N1"; // Week 1: second college pick saved under 'NFL'
-      byUser[id].selections[slot] = {
-        team: r.team,
-        line:
-          r.spread === null || r.spread === undefined
-            ? ""
-            : r.spread > 0
-            ? `+${r.spread}`
-            : `${r.spread}`,
-        loy: (r.bonus || "").includes("LOY"),
-        loq: (r.bonus || "").includes("LOQ"),
-        dog: (r.bonus || "").includes("DOG"),
-        press: !!r.pressed,
+ const picks = useMemo(() => {
+  const byUser = {};
+  for (const r of dbPicks) {
+    const id = r.user_id;
+    if (!byUser[id]) {
+      byUser[id] = {
+        player: DISPLAY_NAME[id] || titleCase(id),
+        selections: { C1: null, N1: null }, // C1 = first college; N1 = NFL OR second college when no NFL
       };
     }
-    return Object.values(byUser).sort((a, b) => a.player.localeCompare(b.player));
-  }, [dbPicks]);
+
+    // Normalize row -> pick object
+    const pickObj = {
+      team: r.team,
+      line:
+        r.spread === null || r.spread === undefined
+          ? ""
+          : r.spread > 0
+          ? `+${r.spread}`
+          : `${r.spread}`,
+      loy: (r.bonus || "").includes("LOY"),
+      loq: (r.bonus || "").includes("LOQ"),
+      dog: (r.bonus || "").includes("DOG"),
+      press: !!r.pressed,
+      league: r.league,
+    };
+
+    if (r.league === "NCAA") {
+      // First NCAA goes to C1, second NCAA (if present) goes to N1 (Week 1 behavior)
+      if (!byUser[id].selections.C1) {
+        byUser[id].selections.C1 = pickObj;
+      } else if (!byUser[id].selections.N1) {
+        byUser[id].selections.N1 = pickObj; // show under the "Pro Pick" column per Week 1 rules
+      }
+    } else if (r.league === "NFL") {
+      byUser[id].selections.N1 = pickObj; // normal weeks
+    }
+  }
+
+  return Object.values(byUser).sort((a, b) => a.player.localeCompare(b.player));
+}, [dbPicks]);
+
 
   // Compute rows with live score lookup per team
   const rows = useMemo(() => {
