@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { supabase } from "./supabaseClient";
 import SeasonScorecard from "./SeasonScorecard";
 import SeasonScorecardGrid from "./SeasonScorecardGrid";
+import { pinEventAndInsertPick } from "./pages/pinEventAndInsertPick";
+
 let GLOBAL_STANDINGS_ORDER = [];
 
 const ODDS_KEY = (process.env.REACT_APP_ODDS_API_KEY || "").trim();
@@ -10,6 +12,7 @@ console.log("ODDS KEY LEN:", ODDS_KEY.length);
 /** ================== CONFIG ================== **/
 const CURRENT_QUARTER = "Q1";
 const RATE = Number(process.env.REACT_APP_RATE ?? 1);
+const DRAFT_MODE = false; // when true, picks are LOCAL ONLY until you commit
 
 // Bonus amounts (stackable). Same for Sweep/Reverse & Quigger/Reverse.
 const SWEEP_WINNER = 46.88;
@@ -17,46 +20,101 @@ const SWEEP_LOSER = -9.38;
 const REVERSE_SWEEP_WINNER = 9.38;
 const REVERSE_SWEEP_LOSER = -46.88;
 
-/** ================== DB HELPERS ================== **/
 async function savePickToDB({
   weekId, userId, slot, league, team, spread, odds, bonus, pressed,
   steal, stolen, stolenBy,
-  espnEventId, espnHome, espnAway, espnCommence
+  espnEventId, espnHome, espnAway, espnCommence,
+  forceWrite = false,
 }) {
+  // Draft mode: do NOT write to Supabase unless forceWrite=true
+  
 
 
-  if (weekId == null) return { error: new Error("Missing numeric weekId") };
+  // Draft mode: do NOT write to Supabase yet
+  if (DRAFT_MODE) {
+    console.log("[DRAFT_MODE] Skipping DB write:", { weekId, userId, slot, league, team, spread, odds, bonus, pressed });
+    return { data: null, error: null, resolvedEventId: espnEventId || null };
+  }
+  if (!league) league = (slot === "A" ? "NCAA" : (slot === "B" ? "NFL" : null));
 
-  const { data, error } = await supabase
-    .from("picks")
-    .upsert(
-      [{
+console.log(`[SAVE->DB] weekId=${weekId} userId=${userId} league=${league} slot=${slot} team=${team} spread=${spread} bonus=${bonus}`);
+
+
+  if (!weekId || !userId || !slot || !team) {
+    return { data: null, error: new Error("Missing required fields") };
+  }
+
+  try {
+    // If we DON'T already have an ESPN event id, auto-pin and INSERT via helper.
+    if (!espnEventId) {
+      const payload = {
         week_id: weekId,
         user_id: userId,
-        slot,                 // 'A' | 'B'
-        league,               // 'NCAA' | 'NFL'
-        team, spread, odds,
+        slot,                 // keep using your existing 'A' | 'B' slot value
+        league,               // e.g. 'NCAA' or 'NFL' (helper is sport-aware)
+        team,
+        spread,
+        odds,
         bonus: bonus || null,
         pressed: !!pressed,
         steal: !!steal,
-stolen: !!stolen,
-stolen_by: stolenBy ?? null,
+        stolen: !!stolen,
+        stolen_by: stolenBy ?? null,
 
-        ext_source: 'espn',
-        espn_event_id: espnEventId || null,
+        // fields the helper may enrich if it resolves an event id
+        ext_source: "espn",
+        espn_event_id: null,
         espn_home: espnHome || null,
         espn_away: espnAway || null,
         espn_commence: espnCommence || null,
-      }],
-      { onConflict: "week_id,user_id,slot" }
-    )
-    
-    .select();
+      };
 
-  if (error) console.error("savePickToDB error:", error);
-  else console.log("saved pick →", data);
-  return { data, error };
+      const { inserted, resolvedEventId } =
+        await pinEventAndInsertPick(supabase, payload);
+
+      return { data: inserted, error: null, resolvedEventId };
+    }
+
+    // If we DO already have an event id, keep your original UPSERT path.
+    const { data, error } = await supabase
+      .from("picks")
+      .upsert(
+        [
+          {
+            week_id: weekId,
+            user_id: userId,
+            slot, // 'A' | 'B'
+            league,
+            team,
+            spread,
+            odds,
+            bonus: bonus || null,
+            pressed: !!pressed,
+            steal: !!steal,
+            stolen: !!stolen,
+            stolen_by: stolenBy ?? null,
+
+            ext_source: "espn",
+            espn_event_id: espnEventId || null,
+            espn_home: espnHome || null,
+            espn_away: espnAway || null,
+            espn_commence: espnCommence || null,
+          },
+        ],
+        { onConflict: "week_id,user_id,slot,league" }
+
+      )
+      .select()
+      .single();
+
+    if (error) throw error;
+    return { data, error: null, resolvedEventId: espnEventId };
+  } catch (e) {
+    console.error("savePickToDB error:", e);
+    return { data: null, error: e };
+  }
 }
+
 
 // --- ESPN resolver helpers ---
 function normName(s) {
@@ -531,6 +589,8 @@ function canTakeTeam({ attemptorId, victimId, victimBonus, chosenBonus }) {
 
 /** ================== MAIN COMPONENT ================== **/
 export default function PickemLocal() {
+  const [isCommitting, setIsCommitting] = useState(false);
+
  const showSeason = window.location.pathname.endsWith("/season");
 const [page, setPage] = useState("pick");
 
@@ -539,12 +599,45 @@ const [page, setPage] = useState("pick");
   // Numeric week id from DB (for saving)
  const [currentWeekId, setCurrentWeekId] = useState(null);
 const [weekStatus, setWeekStatus] = useState(null);
-const [weekLabel, setWeekLabel] = useState("Q1-W1");
+const [weekLabel, setWeekLabel] = useState("");
 const [standingsOrder, setStandingsOrder] = useState([]);
 
 const DISPLAY_WEEK_LABEL = weekLabel; // <— add this line
 // === Overall standings order (for sorting the Pick'em list) ===
 
+// Auto-select the current open week so the page only shows/saves for that week
+useEffect(() => {
+  let cancel = false;
+  (async () => {
+    const { data: weeks, error } = await supabase
+      .from("week_schedule")
+     .select("week_id,label,is_locked,open_at,close_at")
+
+      .order("week_id", { ascending: true });
+
+    if (error || !weeks?.length) return;
+
+// Prefer the next upcoming unlocked week; otherwise newest unlocked; otherwise last row.
+// Prefer the next upcoming unlocked week; otherwise newest unlocked; otherwise last row.
+const today = new Date();
+const upcoming = [...weeks]
+  .filter((w) => !w.is_locked && new Date(w.open_at) >= today)
+  .sort((a, b) => new Date(a.open_at) - new Date(b.open_at))[0];
+
+const target = upcoming || [...weeks].reverse().find((w) => !w.is_locked) || weeks[weeks.length - 1];
+
+
+
+if (!cancel && target) {
+  setCurrentWeekId(target.week_id);
+
+          // <- your savePickToDB already uses weekId
+      // Optional: if your form keeps old inputs, clear them here:
+      // setTeamA(""); setTeamB(""); setSpreadA(null); setSpreadB(null);
+    }
+  })();
+  return () => { cancel = true; };
+}, []);
 
 useEffect(() => {
   let mounted = true;
@@ -635,24 +728,30 @@ const isWeekOne = Number(currentWeekId) === 1; // special: two college picks
     return () => { cancelled = true; };
   }, [CURRENT_QUARTER]);
 
+// Keep the header in sync with whatever week is currently selected
 useEffect(() => {
+  if (!currentWeekId) return;     // wait until we know the numeric week id
   let mounted = true;
 
   (async () => {
     const { data, error } = await supabase
-      .from("vw_current_week")
-      .select("*")
+      .from("week_schedule")
+      .select("label, quarter, is_locked")
+      .eq("week_id", currentWeekId)
       .single();
 
-    if (error || !data || !mounted) return;
+    if (!mounted || error || !data) return;
 
-    setCurrentWeekId(data.week_id);
-    setWeekStatus(data.status);
-    setWeekLabel(`${data.quarter}-${data.label}`); // e.g. "Q1-W2"
+    setWeekStatus(data.is_locked ? "LOCKED" : "OPEN");
+const qNum = parseInt(String(data.quarter).replace(/\D/g, ''), 10);
+const wNum = parseInt(String(data.label).replace(/\D/g, ''), 10);
+const wInQuarter = ((wNum - 1) % 4) + 1; // W5 -> 1, W6 -> 2, etc.
+setWeekLabel(`Q${qNum}W${wInQuarter}`);
   })();
 
   return () => { mounted = false; };
-}, []);
+}, [currentWeekId]);
+
 // === Overall standings (per quarter) ===
 const [standings, setStandings] = useState([]);
 
@@ -713,20 +812,75 @@ setStandings(
 
 
   const [currentUserId, setCurrentUserId] = useState("chris");
-
-  useEffect(() => {
+  // Resolve the current week strictly by schedule dates
+useEffect(() => {
+  let mounted = true;
   (async () => {
-    const { data, error } = await supabase
-      .from("weeks")
-      .select("id,status")
-      .order("id", { ascending: false }) // newest first
+    const todayStr = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+    // open_at <= today < close_at
+    let { data, error } = await supabase
+      .from("week_schedule")
+      .select("week_id")
+      .lte("open_at", todayStr)
+      .gt("close_at", todayStr)
+      .order("open_at", { ascending: false })
       .limit(1)
-      .single();
-    if (error || !data) { console.error("weeks load error:", error || "no rows"); return; }
-    setCurrentWeekId(data.id);
-    setWeekStatus(data.status); // OPEN or LOCKED
+      .maybeSingle();
+
+    if ((!data || error) && mounted) {
+      const res2 = await supabase
+        .from("week_schedule")
+        .select("week_id")
+        .gt("open_at", todayStr)
+        .order("open_at", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      data = res2.data ?? null;
+    }
+
+    if (mounted && data) setCurrentWeekId(data.week_id);
   })();
+  return () => { mounted = false; };
 }, []);
+
+const [bonusUsage, setBonusUsage] = useState({}); // { [user_id]: { loy_used, loq_used, dog_used } }
+useEffect(() => {
+  if (!currentWeekId) return;
+  let cancel = false;
+
+  (async () => {
+    // find the quarter for the selected week
+    const { data: ws, error: wsErr } = await supabase
+      .from("week_schedule")
+      .select("quarter")
+      .eq("week_id", currentWeekId)
+      .single();
+    if (wsErr || !ws?.quarter) return;
+
+    // pull usage for that quarter from the view
+    const { data: rows, error } = await supabase
+      .from("v_bonus_usage")
+      .select("user_id,loy_used,loq_used,dog_used")
+      .eq("quarter", ws.quarter);
+
+    if (!cancel && !error && rows) {
+      const map = {};
+      for (const r of rows) {
+        map[r.user_id] = {
+          loy_used: !!r.loy_used,
+          loq_used: !!r.loq_used,
+          dog_used: !!r.dog_used,
+        };
+      }
+      setBonusUsage(map);
+    }
+  })();
+
+  return () => { cancel = true; };
+}, [currentWeekId]);
+
+ 
 
 
   // local players state (persist in localStorage)
@@ -944,14 +1098,14 @@ const stolenBy = null;
       return;
     }
 
-    // If taking WITHOUT any LOY/LOQ, require the STEAL checkbox as confirmation
-    if (!rulesToken.includes("LOY") && !rulesToken.includes("LOQ") && !steal) {
-      alert("Check the STEAL box to confirm taking this team without a token.");
-      return;
-    }
+   // Auto-mark STEAL if you're taking someone else's team
+if (victimId && victimId !== playerId) {
+  steal = true;
+}
 
-    // remove from victim, add to attemptor (local state)
-    setPlayers((prev) => {
+// remove from victim, add to attemptor (local state)
+setPlayers((prev) => {
+
       let next = prev;
 
       if (victimId && victimId !== playerId) {
@@ -988,6 +1142,31 @@ CURRENT_WEEK_LABEL_FOR_USAGE = DISPLAY_WEEK_LABEL;
 
       return recalcBonusUsage(next);
     });
+// --- DB: ensure the picker (current player) has a row for this league/week
+await savePickToDB({
+  weekId: currentWeekId,                   // canonical week
+  userId: playerId,                        // <- the picker (e.g., kevin)
+  league,                                  // "NCAA" or "NFL"
+  slot: type === "college" ? "A" : "B",
+  team: line.team,
+  opponent: line.opponent,
+  spread: line.spread,
+  odds: line.odds,
+});
+
+// --- DB: if this was a steal, mark the victim's row as stolen
+if (victimId && victimId !== playerId) {
+  await supabase
+    .from("picks")
+    .update({
+      stolen_by: playerId,
+      stolen_at: new Date().toISOString(),
+      stolen_token: "STEAL",
+    })
+    .eq("week_id", currentWeekId)
+    .eq("user_id", victimId)
+    .eq("league", league);
+}
 
     // save to DB with the numeric week id
 // BEFORE calling savePickToDB: resolve the ESPN event for this pick
@@ -1040,6 +1219,159 @@ if (steal && victimId) {
 
     closeSelector();
   };
+  // Clear one pick (local state + Supabase) for the open week
+async function clearPick({ playerId, type }) {
+  try {
+    const league = type === "college" ? "NCAA" : "NFL";
+
+    // 1) Remove from local React state
+    setPlayers((prev) => {
+      const next = prev.map((p) => {
+        if (p.id !== playerId) return p;
+        const nextPicks = { ...(p.picks || {}) };
+        const wk = { ...(nextPicks[DISPLAY_WEEK_LABEL] || {}) };
+        delete wk[type];                           // <- remove just this slot
+        nextPicks[DISPLAY_WEEK_LABEL] = wk;
+        return { ...p, picks: nextPicks };
+      });
+      return recalcBonusUsage(next);               // keep LOY/LOQ/DOG usage accurate
+    });
+
+    // 2) Delete the row in Supabase
+    const { error } = await supabase
+      .from("picks")
+      .delete()
+      .eq("week_id", currentWeekId)
+      .eq("user_id", playerId)
+      .eq("league", league);
+
+    if (error) console.error("[clearPick] delete error:", error);
+  } catch (e) {
+    console.error("[clearPick] unexpected:", e);
+  } finally {
+    closeSelector(); // close the modal if it’s open
+  }
+}
+async function commitWeekDraft() {
+  console.log("[COMMIT] clicked for", DISPLAY_WEEK_LABEL, "week_id:", currentWeekId);
+
+  if (!currentWeekId) {
+    alert("No current week selected.");
+    return;
+  }
+  // gather picks for this display week from local state
+  const wkKey = DISPLAY_WEEK_LABEL; // e.g., "Q1-W4"
+  const payloads = [];
+
+  for (const p of players) {
+    const wk = p?.picks?.[wkKey] || {};
+    // college
+    if (wk.college?.team) {
+      payloads.push({
+        playerId: p.id,
+        type: "college",
+        league: "NCAA",
+        team: wk.college.team,
+        spread: wk.college.spread ?? null,
+        odds: wk.college.odds ?? null,
+        bonus: wk.college.bonus ?? null,
+        pressed: !!wk.college.pressed,
+        steal: !!wk.college.steal,
+        stolen: !!wk.college.stolen,
+        stolenBy: wk.college.stolen_by ?? null,
+      });
+    }
+    // nfl
+        // pro
+    if (wk.pro?.team) {
+      payloads.push({
+        playerId: p.id,
+        type: "pro",
+        league: "NFL",
+        team: wk.pro.team,
+        spread: wk.pro.spread ?? null,
+        odds: wk.pro.odds ?? null,
+        bonus: wk.pro.bonus ?? null,
+        pressed: !!wk.pro.pressed,
+        steal: !!wk.pro.steal,
+        stolen: !!wk.pro.stolen,
+        stolenBy: wk.pro.stolen_by ?? null,
+      });
+    }
+
+  }
+console.log("COMMIT payloads:", payloads, "week_id:", currentWeekId);
+
+  if (!payloads.length) {
+    alert("No local picks found to send.");
+    return;
+  }
+
+  if (!window.confirm(`Send ${payloads.length} pick(s) for ${wkKey} to Supabase?`)) {
+    return;
+  }
+
+  try {
+    setIsCommitting(true);
+
+    // delete existing rows for this week & these users/leagues to avoid dupes
+    // (bulk by user+league)
+    const uniqueKeys = new Set(payloads.map(x => `${x.playerId}::${x.league}`));
+    for (const key of uniqueKeys) {
+      const [userId, league] = key.split("::");
+      const { error: delErr } = await supabase
+        .from("picks")
+        .delete()
+        .eq("week_id", currentWeekId)
+        .eq("user_id", userId)
+        .eq("league", league);
+      if (delErr) console.warn("delete pre-existing rows failed:", delErr);
+    }
+
+    // insert each pick using the same helper path as normal saves
+    for (const x of payloads) {
+      // best-effort ESPN event lookup (state doesn’t store opponent/commence)
+      const resolved = await resolveEspnEvent({
+        league: x.league,
+        teamName: x.team,
+        opponentName: null,
+        kickoffIso: null,
+      });
+
+      const { error: saveErr } = await savePickToDB({
+        weekId: currentWeekId,
+        userId: x.playerId,
+        slot: x.type === "college" ? "A" : "B",
+        league: x.league,
+        team: x.team,
+        spread: x.spread,
+        odds: x.odds,
+        bonus: x.bonus === "NONE" ? null : x.bonus,
+        pressed: !!x.pressed,
+        steal: !!x.steal,
+        stolen: !!x.stolen,
+        stolenBy: x.stolenBy ?? null,
+        espnEventId: resolved.espnEventId,
+        espnHome: resolved.espnHome,
+        espnAway: resolved.espnAway,
+        espnCommence: resolved.espnCommence,
+        forceWrite: true, // <— bypasses Draft Mode guard
+      });
+
+      if (saveErr) {
+        console.error("commit save error:", saveErr);
+        alert(`Failed to save pick for ${x.playerId} (${x.league}): ${saveErr.message || saveErr}`);
+        // keep going to try others
+      }
+    }
+
+    alert("Picks sent to Supabase.");
+  } finally {
+    setIsCommitting(false);
+  }
+}
+
+
 
   /** WEEK / OVERALL MATH (local display uses DISPLAY_WEEK_LABEL) */
   const { dollars: weekDollarsBaseMap } = useMemo(
@@ -1087,7 +1419,8 @@ if (steal && victimId) {
     alert("Cleared local picks in React state.");
   };
 if (page === "season") return <SeasonScorecard />;
-{page === "grid" && <SeasonScorecardGrid />}
+if (page === "grid") return <SeasonScorecardGrid />;
+
 
 
   return (
@@ -1111,37 +1444,13 @@ if (page === "season") return <SeasonScorecard />;
           SAC Pick’Em
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <label style={{ color: "#c7d2fe", fontSize: 12 }}>Who am I?</label>
-          <select
-            value={currentUserId}
-            onChange={(e) => setCurrentUserId(e.target.value)}
-            style={{ padding: "4px 8px", borderRadius: 6 }}
-          >
-            <option value="joey">Joey</option>
-            <option value="kevin">Kevin</option>
-            <option value="dan">Dan</option>
-            <option value="aaron">Aaron</option>
-            <option value="chris">Chris</option>
-            <option value="nick">Nick</option>
-          </select>
-        </div>
+        
       </div>
 
       <div style={{ padding: 12 }}>
-  <button
-    onClick={clearLocalPicks}
-    style={{ marginLeft: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
-  >
-    Clear Local Picks
-  </button>
+ 
 
-  <button
-    onClick={() => setPage("season")}
-    style={{ marginLeft: 8, padding: "6px 10px", borderRadius: 6, border: "1px solid #e5e7eb" }}
-  >
-    Go to Season Scorecard
-  </button>
+ 
 
   <button
     onClick={() => setPage("grid")}
@@ -1164,6 +1473,23 @@ if (page === "season") return <SeasonScorecard />;
   >
     Go to Live Picks
   </button>
+  <button
+  onClick={commitWeekDraft}
+  disabled={isCommitting || !currentWeekId}
+  style={{
+    marginLeft: 8,
+    padding: "6px 10px",
+    borderRadius: 6,
+    border: "1px solid #e5e7eb",
+    background: isCommitting ? "#9ca3af" : "#10b981",
+    color: "white",
+    fontWeight: 700,
+    cursor: isCommitting ? "not-allowed" : "pointer",
+  }}
+>
+  {isCommitting ? "Sending..." : "Send to Supabase"}
+</button>
+
 </div>
 
 
@@ -1171,6 +1497,8 @@ if (page === "season") return <SeasonScorecard />;
       {selector && (
         <PickModal
           selector={selector}
+            clearPick={clearPick}
+
           onClose={() => setSelector(null)}
           onConfirm={({ line, steal }) => onConfirmPick({ playerId: selector.playerId, type: selector.type, line, steal })}
           collegeLines={collegeLines}
@@ -1261,7 +1589,8 @@ if (page === "season") return <SeasonScorecard />;
   }}>
     <div style={{ fontWeight: 800, marginBottom: 8 }}>
 {/* OVERALL STANDINGS (top copy) */}
-<div style={{ border: "1px solid #e5e5e5", borderRadius: 12, padding: 12, marginBottom: 12 }}>
+<div style={{ display: "none" }}>
+
   <div style={{ fontWeight: 800, marginBottom: 6 }}>
     Overall Standings
   </div>
@@ -1300,11 +1629,11 @@ const r = ats[p.id] ?? { w: 0, l: 0, p: 0 };
   </div>
 </div>
 
-      Bonus Summary — {CURRENT_QUARTER}
+      Bonus Summary 
     </div>
 
     <div style={{
-      display: "grid",
+      display: "none",
       gridTemplateColumns: "1fr auto auto",
       gap: 8,
       padding: "4px 0",
@@ -1319,9 +1648,11 @@ const r = ats[p.id] ?? { w: 0, l: 0, p: 0 };
     </div>
 
     {players.map((p) => {
-      const usedLOY = !!p.bonusUsage?.LOY;
-      const usedLOQ = !!p.bonusUsage?.LOQ?.[CURRENT_QUARTER];
-      const usedDOG = !!p.bonusUsage?.DOG?.[CURRENT_QUARTER];
+      const u = bonusUsage[p.id] || {};
+const usedLOY = !!u.loy_used;  // season-wide
+const usedLOQ = !!u.loq_used;  // per quarter
+const usedDOG = !!u.dog_used;  // per quarter
+
 
       return (
         <div
@@ -1385,7 +1716,7 @@ const r = ats[p.id] ?? { w: 0, l: 0, p: 0 };
       );
     })}
     <div style={{ marginTop: 8, fontSize: 12, color: "#64748b" }}>
-      LOY is once per season. LOQ & DOG reset each quarter (showing usage for <b>{CURRENT_QUARTER}</b>).
+      
     </div>
   </div>
 </div>
@@ -1450,7 +1781,10 @@ function PickModal({
   weekIdLabel,
   overallDollars,
   isWeekOne,
+  clearPick,
 }) {
+
+
   const [steal, setSteal] = useState(false);
 
   // standings helpers
@@ -1561,6 +1895,22 @@ function PickModal({
           <div style={{ fontWeight: 800, fontSize: 18 }}>
             Pick a {selector.type === "college" ? "College" : "Pro"} team
           </div>
+          <button
+  onClick={() => clearPick({ playerId: selector.playerId, type: selector.type })}
+  style={{
+    marginLeft: 12,
+    padding: "4px 8px",
+    borderRadius: 6,
+    border: "1px solid #e5e7eb",
+    background: "#fee2e2",
+    color: "#991b1b",
+    fontSize: 12,
+    fontWeight: 600,
+  }}
+>
+  Erase Pick
+</button>
+
           <button onClick={onClose}>Close</button>
         </div>
 
@@ -1609,13 +1959,14 @@ function PickModal({
             <label htmlFor="press-toggle">Press</label>
 
             <label style={{ marginLeft: 12 }}>
-              <input
-                type="checkbox"
-                checked={steal}
-                onChange={(e) => setSteal(e.target.checked)}
-              />{" "}
-              STEAL
-            </label>
+  <input
+    type="checkbox"
+    checked={steal}
+    onChange={(e) => setSteal(e.target.checked)}
+  />{" "}
+  STEAL
+</label>
+
           </div>
         </div>
 
@@ -1935,7 +2286,8 @@ function MakePicksTable({ players, weekIdLabel, onCellClick, locked, currentUser
   );
 }
 /* ===== Compact Bonus Summary (red when used) ===== */
-function BonusSummaryCompact({ players, quarter }) {
+function BonusSummaryCompact({ players, quarter, bonusUsage = {} })
+{
   const Chip = ({ label, used }) => (
     <span
       style={{
@@ -1966,9 +2318,11 @@ return (
 
       <div style={{ display: "grid", rowGap: 6 }}>
         {players.map((p) => {
-          const usedLOY = !!p.bonusUsage?.LOY;                        // season-wide
-          const usedLOQ = !!p.bonusUsage?.LOQ?.[quarter];             // per quarter
-          const usedDOG = !!p.bonusUsage?.DOG?.[quarter];             // per quarter
+          const u = bonusUsage[p.id] || {};
+const usedLOY = !!u.loy_used;
+const usedLOQ = !!u.loq_used;
+const usedDOG = !!u.dog_used;
+            // per quarter
           return (
             <div
               key={p.id}

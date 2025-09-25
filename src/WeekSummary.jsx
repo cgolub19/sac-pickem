@@ -1,992 +1,723 @@
-// src/pages/WeekSummary.jsx
-import React, { useEffect, useMemo, useState } from "react";
+// src/WeekSummary.jsx
+import React, { useEffect, useState, useMemo, useRef } from "react";
 import { supabase } from "./supabaseClient";
-// Map your DB pick names → ESPN names
-const NAME_ALIAS = {
-  "Hawaii Rainbow Warriors": "Hawai'i Rainbow Warriors",
-  "Fresno St": "Fresno State Bulldogs",
-  "Stanford": "Stanford Cardinal",
-};
 
-/** ====== SCORING CONFIG ====== **/
-const MONEY = {
-  win: 10,
-  loss: -10,
-  push: 0,
-  bonuses: { quigger: 5, reverseQuigger: 5, sweep: 5, reverseSweep: 5, dog: 5 },
-};
-function normName(s = "") {
-  return String(s)
-    .toLowerCase()
-    .replace(/[’'‘`]/g, "")   // remove apostrophes
-    .replace(/[\.\-]/g, " ")  // dots and dashes to spaces
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function dateKey(iso) {
-  // turn ISO into YYYY-MM-DD (day resolution)
+/* ===== formatting helpers ===== */
+const titleCase = (s) => (!s ? "" : s.slice(0, 1).toUpperCase() + s.slice(1));
+const dateKey = (iso) => {
   const d = new Date(iso);
   return isNaN(d) ? "" : d.toISOString().slice(0, 10);
-}
+};
+const fmtMoney = (n) =>
+  (Number(n || 0) >= 0 ? "+$" : "-$") + Math.abs(Number(n || 0)).toFixed(2);
+const ptsFmt = (n) => (n == null ? "—" : `(${Number(n).toFixed(Math.abs(n) % 1 ? 1 : 0)})`);
+const moneyColor = (n) => (n > 0 ? "#067647" : n < 0 ? "#b42318" : "#475569");
+const okColor = (ok) => (ok === true ? "#067647" : ok === false ? "#b42318" : "#475569");
 
-/** ====== ENV for live scores ====== **/
-const API_BASE = process.env.REACT_APP_ODDS_API_BASE || "https://api.the-odds-api.com/v4";
-const API_KEY = process.env.REACT_APP_ODDS_API_KEY; // required for live scores
+/* ===== robust name normalizers ===== */
+const _strip = (s = "") =>
+  s
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/['’`]/g, "")
+    .replace(/[\.\-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-/** ====== HELPERS ====== **/
-const titleCase = (s) => (!s ? "" : s.slice(0, 1).toUpperCase() + s.slice(1));
-const DISPLAY_NAME = { joey: "Joey", chris: "Chris", dan: "Dan", nick: "Nick", kevin: "Kevin", aaron: "Aaron" };
-// Bonus amounts (total per person)
-const BONUS_AMT = Object.freeze({
-  SWEEP: 46.88,
-  REVERSE_SWEEP: -46.88,
-  QUIGGER: -46.88,
-  REVERSE_QUIGGER: 46.88,
-  DOG: 93.75,          // underdog +7 or more wins outright
-  GOOSE: 93.75,        // your team shuts out opponent
-  COOKED_GOOSE: -140.62 // favorite (>= -2.0) gets shut out
-});
+const _expand = (s = "") =>
+  s
+    .replace(/\bst\b/g, "state")
+    .replace(/\buniv(?:ersity)?\b/g, "")
+    .replace(/\bthe\b/g, "")
+    .replace(/\bmen(?:'s)?\b/g, "")
+    .replace(/\bfootball\b/g, "")
+    .replace(/\bof\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
-// Use your existing parseLine if you have it.
-// If you DO NOT have one, uncomment this minimal fallback:
-// function parseLine(x){ const n = Number(String(x||0).replace(/\s/g,'')); return Number.isFinite(n)?n:0; }
-function buildWeekSnapshot(rows, { weekId, quarter, label }) {
-  return {
-    week_id: weekId,
-    quarter,
-    label,
-    rows: rows.map((r) => ({
-      player: r.player,
-      college_pts: r.college?.res?.pts ?? null,
-      college_dollars: Number(r.collegeDollar || 0).toFixed(2),
-      pro_pts: r.pro?.res?.pts ?? null,
-      pro_dollars: Number(r.proDollar || 0).toFixed(2),
-      bonus_labels: r.bonuses || [],
-      bonus_total: Number(r.bonusesTotal || 0).toFixed(2),
-      week_total: Number(r.weekTotal || 0).toFixed(2),
-    })),
-    sum: Number(
-      rows.reduce((a, r) => a + Number(r.weekTotal || 0), 0).toFixed(2)
-    ),
-  };
-}
-
-function gameFacts(meta, teamName, lineText) {
-  if (!meta) return null;
-
-  const homeTeam  = meta.home ?? meta.espn_home ?? meta.homeTeam;
-  const awayTeam  = meta.away ?? meta.espn_away ?? meta.awayTeam;
-  const homeScore = meta.homeScore ?? meta.home_score ?? null;
-  const awayScore = meta.awayScore ?? meta.away_score ?? null;
-
-  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return null;
-
-  // tolerate normName not existing
-  const nn = (v) => (typeof normName === "function" ? normName(v) : String(v || "").toLowerCase());
-  const isHome = nn(homeTeam) === nn(teamName);
-
-  const my  = isHome ? homeScore : awayScore;
-  const opp = isHome ? awayScore : homeScore;
-
-  const line = Number.isFinite(lineText) ? Number(lineText)
-             : (typeof parseLine === "function" ? parseLine(lineText) : Number(lineText) || 0);
-
-  const covered = (my - opp) + line > 0;
-  const won     = my > opp;
-  const shutFor = opp === 0;
-  const shutAgainst = my === 0;
-
-  return {
-    covered, won, shutFor, shutAgainst,
-    line,
-    isFav: line < 0,
-    isDog: line > 0
-  };
-}
-
-function dogBonusHit(pick, facts) {
-  // must be tagged dog, be +7 or more, and win outright
-  return Boolean(pick?.dog) && Boolean(facts?.isDog) && Number(facts?.line) >= 7 && Boolean(facts?.won);
-}
-
-const toNum = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
-const parseLine = (s) => (s === null || s === undefined ? 0 : Number(String(s).replace(/\s/g, "")));
-
-function scoreline(g) {
-  if (!g) return "—";
-  const matchup = `${g.away} @ ${g.home}`;
-
-  const haveScores =
-    Number.isFinite(g.awayScore) && Number.isFinite(g.homeScore);
-
-  if (haveScores) {
-    const tail = g.completed ? " (FT)" : "";
-    return `${matchup}: ${g.awayScore}–${g.homeScore}${tail}`;
-  }
-
-  // Not started yet — show kickoff time
-  let when = "TBD";
-  try {
-    if (g.commence) {
-      const d = new Date(g.commence);
-      when = d.toLocaleString(undefined, {
-        weekday: "short",
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-      });
+const normalizeName = (s = "") => {
+  const t = _expand(_strip(s));
+  return t
+    .split(" ")
+    .map((w) => (w.length > 4 && !/ss$/.test(w) ? w.replace(/s$/, "") : w))
+    .join(" ")
+    .trim();
+};
+const tokensOf = (s = "") => normalizeName(s).split(" ").filter(Boolean);
+const tokenSet = (s = "") => new Set(tokensOf(s));
+const jaccard = (a, b) => {
+  const A = tokenSet(a), B = tokenSet(b);
+  if (!A.size && !B.size) return 1;
+  let inter = 0; for (const x of A) if (B.has(x)) inter++;
+  const uni = A.size + B.size - inter;
+  return uni ? inter / uni : 0;
+};
+const levenshtein = (a, b) => {
+  a = normalizeName(a); b = normalizeName(b);
+  const m = a.length, n = b.length;
+  if (!m) return n; if (!n) return m;
+  const dp = Array(n + 1).fill(0).map((_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0]; dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j];
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = tmp;
     }
-  } catch { /* noop */ }
-
-  return `${matchup} — ${when}`;
-}
-function findByTeamOnDate(idx, team, iso) {
-  if (!team || !iso) return null;
-  const targetDay = dateKey(iso); // YYYY-MM-DD
-  for (const meta of Object.values(idx)) {
-    if (!meta || !meta.commence) continue;
-    if (dateKey(meta.commence) !== targetDay) continue;
-    const h = normName(meta.home);
-    const a = normName(meta.away);
-    const t = normName(team);
-    if (h === t || a === t) return meta;
   }
-  return null;
-}
-function balanceDollars(askips) {
-  const total = askips.reduce((a, b) => a + b, 0);
-  return askips.map(a => (6 * a - total) * RATE);
-}
+  return dp[n];
+};
+const levRatio = (a, b) => {
+  const L = Math.max(normalizeName(a).length, normalizeName(b).length) || 1;
+  return 1 - levenshtein(a, b) / L;
+};
+const similar = (a, b) => 0.6 * jaccard(a, b) + 0.4 * levRatio(a, b);
 
-function coverageForPick(g, pick) {
-  if (!g || !pick || !pick.team) return { dollars: 0, pts: 0, ok: null };
-  if (!Number.isFinite(g.awayScore) || !Number.isFinite(g.homeScore)) {
-    return { dollars: 0, pts: 0, ok: null }; // game not started / incomplete
-  }
-  const line = parseLine(pick.line || "0");
-  const isAway = pick.team === g.away;
-  const picked = isAway ? g.awayScore : g.homeScore;
-  const opp = isAway ? g.homeScore : g.awayScore;
-  const diff = picked + line - opp; // >0 covered, <0 missed
-  if (diff > 0) return { dollars: MONEY.win, pts: diff, ok: true };
-  if (diff < 0) return { dollars: MONEY.loss, pts: diff, ok: false };
-  return { dollars: MONEY.push, pts: 0, ok: null };
-}
-
-const dollarsFmt = (n) => (n > 0 ? `+$${n}` : n < 0 ? `-$${Math.abs(n)}` : "$0");
-const ptsFmt = (n) => `(${Number.isInteger(n) ? n : n.toFixed(1)})`;
-const colorFor = (ok) => (ok === true ? "#067647" : ok === false ? "#b42318" : "#475569");
-
-function bonusNames(bonuses) {
-  return Object.entries(bonuses || {})
-    .filter(([_, v]) => v)
-    .map(([k]) => {
-      switch (k) {
-        case "quigger": return "Quigger";
-        case "reverseQuigger": return "Reverse Quigger";
-        case "sweep": return "Sweep";
-        case "reverseSweep": return "Reverse Sweep";
-        case "dog": return "Dog";
-        default: return k;
-      }
-    });
-}
-function bonusTotal(bonuses) {
-  return Object.entries(bonuses || {}).reduce(
-    (sum, [k, v]) => (v ? sum + (MONEY.bonuses[k] || 0) : sum),
-    0
-  );
-}
-function pickTagPills(pick) {
-  const order = ["loy", "loq", "press", "dog"];
-  return order.filter((t) => pick?.[t]).map((t) => (t === "loy" ? "LOY" : t === "loq" ? "LOQ" : t === "press" ? "Press" : "Dog"));
-}
-// --- Askip calculation helper ---
-const RATE = 0.3125;
-
-// --- Askip calculation helper ---
-function calcAskip({ teamName, spread, meta, pick }) {
-  if (!meta) return 0;
-
-  // normalize team & score fields
-  const homeTeam  = meta.home ?? meta.espn_home ?? meta.homeTeam;
-  const awayTeam  = meta.away ?? meta.espn_away ?? meta.awayTeam;
-  const homeScore = meta.homeScore ?? meta.home_score ?? null;
-  const awayScore = meta.awayScore ?? meta.away_score ?? null;
-
-  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return 0;
-
-  // determine which side this pick is on
-  const isHome = normName(homeTeam) === normName(teamName);
-  const my  = isHome ? homeScore : awayScore;
-  const opp = isHome ? awayScore : homeScore;
-
-  // use numeric spread if present, otherwise parse pick.line
-  const line = Number.isFinite(spread) ? Number(spread) : parseLine(pick?.line);
-
-  const cover = (my - opp) + line;    // >0 covered, <0 missed
-  const mult  = pickMultiplier(pick); // LOY x4, LOQ x2, Press x2
-
-  // Excel: add +7 when the bet covers
-  return cover > 0 ? (cover * mult + 7) : (cover * mult);
-}
-// --- Askip calculation helper ---
-function pickMultiplier(pick) {
-  let m = 1;
-  if (pick?.loy)   m *= 4;  // LOY
-  if (pick?.loq)   m *= 2;  // LOQ
-  if (pick?.press) m *= 2;  // Press
-  return m;
-}
-
-
-
-
-
-
-
-
-
-/** ====== PAGE ====== **/
+/* ===== component ===== */
 export default function WeekSummary() {
-  const [week, setWeek] = useState(null);
-  const [dbPicks, setDbPicks] = useState([]);
-  const [gamesIndex, setGamesIndex] = useState({}); // name -> game meta
-  const [scoresError, setScoresError] = useState(null);
+  const [weekList, setWeekList] = useState([]);
+  const [weekMeta, setWeekMeta] = useState(null);
+  const [weekId, setWeekId] = useState(null);
 
-  // Load latest week + its picks
+  const [wr, setWR] = useState([]);           // weekly_results rows
+  const [dbPicks, setDbPicks] = useState([]); // picks for week
+  const [gamesIndex, setGamesIndex] = useState({});
+
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+
+  /* 1) Load week list, choose default week (most recently locked or past end_date), allow ?week= override */
   useEffect(() => {
     (async () => {
-      const { data: w } = await supabase
-        .from("weeks")
-        .select("id, status, start_date, end_date")
+      try {
+        setLoading(true);
+        setErr("");
 
-        .order("id", { ascending: false })
-        .limit(1)
-        .single();
-
-      if (!w) return;
-      setWeek(w);
-
-      const { data: rows } = await supabase
+// Build week list directly from picks so ids match the data we query
+const { data: pWeeks, error: pwErr } = await supabase
   .from("picks")
-  .select(`
-    user_id, league, team, spread, odds, bonus, pressed, slot,
-    espn_event_id, espn_home, espn_away, espn_commence
-  `)
-  .eq("week_id", w.id);
+  .select("week_id")
+  .order("week_id", { ascending: true });
 
-  
+if (pwErr) throw pwErr;
 
+// unique week_ids present in picks
+const ids = Array.from(new Set((pWeeks || []).map((r) => Number(r.week_id)).filter(Boolean)));
 
-      setDbPicks(rows || []);
+// label them W1, W2, W3 by order so the UI still looks nice
+const weeks = ids.map((id, idx) => ({ week_id: id, label: `W${idx + 1}`, is_locked: true }));
+setWeekList(weeks);
+
+// allow ?week=<id> override, otherwise default to the latest week_id in picks
+const urlWeek = Number(new URLSearchParams(window.location.search).get("week"));
+let wid = Number.isFinite(urlWeek) ? urlWeek : (ids.length ? ids[ids.length - 1] : null);
+
+// fall back to first if nothing else
+if (!wid && ids.length) wid = ids[0];
+
+const meta = (weeks || []).find((w) => w.week_id === wid) || null;
+setWeekMeta(meta);
+setWeekId(wid);
+
+        
+      } catch (e) {
+        console.error(e);
+        setErr(e?.message || String(e));
+      } finally {
+        setLoading(false);
+      }
     })();
   }, []);
 
-// Live scores poll (NCAA + NFL) every 60s — uses SCORES endpoint
-// Live scores poll (NCAA + NFL) every 60s — filter by THIS WEEK
-// Live scores poll — ESPN fallback for completed/past games (NCAA + NFL)
-// Live scores poll via ESPN (Week 1 dates) — includes alias matching
-useEffect(() => {
-  if (!week?.start_date || !week?.end_date) return;
+  /* 2) When week changes, fetch money table + picks */
+  useEffect(() => {
+    if (!weekId) return;
+    (async () => {
+      try {
+        setLoading(true);
+        setErr("");
 
-  // Dates to fetch (YYYYMMDD). Add/remove as needed for a given week.
-  const ESPN_DATES = ["20250823", "20250828", "20250829", "20250830", "20250831"];
+        let wid = weekId;
+
+// --- Weekly money results (with fallback if empty) ---
+let { data: results, error: weeklyErr } = await supabase
+  .from("weekly_results_auto")
+
+  .select("user_id,week_total,college_dollars,pro_dollars,week_id")
+  .eq("week_id", wid)
+  .order("week_total", { ascending: false });
+
+if (weeklyErr) throw weeklyErr;
+
+// Fallback: if this wid has no rows, jump to the latest week that *does* have results
+
+
+setWR(results ?? []);
+
+
+        // Picks for this week (for tokens / Bonus Summary / game matching)
+        const { data: px, error: picksErr } = await supabase
+          .from("picks")
+          .select(
+            "user_id,league,team,spread,bonus,pressed,slot,espn_event_id,espn_home,espn_away,espn_commence"
+          )
+          .eq("week_id", wid);
+        if (picksErr) throw picksErr;
+        setDbPicks(px ?? []);
+
+      } catch (e) {
+        console.error(e);
+        setErr(e?.message || String(e));
+        setWR([]);
+        setDbPicks([]);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [weekId]);
+
+  /* ===== derive Bonus Summary from picks (no DB view needed) ===== */
+  const bonusByType = useMemo(() => {
+    const map = { DOG: [], LOY: [], LOQ: [], STEAL: [], PRESS: [] };
+    for (const p of dbPicks || []) {
+      const name = titleCase(String(p.user_id || "").trim().toLowerCase());
+
+      const b = (p?.bonus || "").toString().toUpperCase();
+      if (b.includes("DOG") && !map.DOG.includes(name)) map.DOG.push(name);
+      if (b.includes("LOY") && !map.LOY.includes(name)) map.LOY.push(name);
+      if (b.includes("LOQ") && !map.LOQ.includes(name)) map.LOQ.push(name);
+      if (p?.pressed && !map.PRESS.includes(name)) map.PRESS.push(name);
+      if (p?.steal && !map.STEAL.includes(name)) map.STEAL.push(name);
+    }
+    return map;
+  }, [dbPicks]);
+
+  /* ===== ESPN game meta building (kept intact) ===== */
+  const matchCacheRef = useRef(new Map()); // key => meta
+  const [gamesBuiltFor, setGamesBuiltFor] = useState({ uids: 0, range: "" });
+
+  /* build games index (id, pairs, single team, tokens) */
+useEffect(() => {
+  const has = (dbPicks || []).length > 0;
+  if (!has) return;
+
+  // Derive a window from espn_commence on the picks (fallback: ±5 days around now)
+  const times = (dbPicks || [])
+    .map((p) => (p.espn_commence ? new Date(p.espn_commence).getTime() : null))
+    .filter(Boolean);
+  let start = new Date(Date.now() - 5 * 86400000);
+  let end   = new Date(Date.now() + 5 * 86400000);
+  if (times.length) {
+    start = new Date(Math.min(...times));
+    end   = new Date(Math.max(...times));
+    start.setDate(start.getDate() - 5);
+    end.setDate(end.getDate() + 5);
+  }
 
   let stop = false;
 
-  async function fetchEspnScores() {
-    try {
-      const mkUrls = (sport) =>
-        ESPN_DATES.map(
-          (d) =>
-            `https://site.api.espn.com/apis/site/v2/sports/football/${sport}/scoreboard?dates=${d}`
-        );
+  async function build() {
+    const idx = {};
+    const seenIds = new Set();
 
-      const urls = [
-        ...mkUrls("college-football"), // NCAAF
-        ...mkUrls("nfl"),              // NFL
-      ];
+    const addMeta = (m) => {
+      if (!m?.id) return;
 
-      const jsons = await Promise.all(
-        urls.map((u) =>
-          fetch(u)
-            .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
-            .catch(() => null)
-        )
-      );
+      // merge by id, preserving scores if one source has them and the other doesn't
+      if (seenIds.has(m.id) && idx[`eid:${m.id}`]) {
+        const prev = idx[`eid:${m.id}`];
+        idx[`eid:${m.id}`] = {
+          ...prev,
+          ...m,
+          awayScore: Number.isFinite(m.awayScore) ? m.awayScore : prev.awayScore,
+          homeScore: Number.isFinite(m.homeScore) ? m.homeScore : prev.homeScore,
+          away: m.away || prev.away,
+          home: m.home || prev.home,
+          commence: m.commence || prev.commence,
+          completed: prev.completed || m.completed,
+        };
+      } else {
+        seenIds.add(m.id);
+        idx[`eid:${m.id}`] = m;
+      }
 
-      // ── TEAM ALIASES (your DB team names → ESPN names) ────────────────
-      const TEAM_ALIASES = {
-        "Hawaii Rainbow Warriors": "Hawai'i Rainbow Warriors",
-        "Fresno St": "Fresno State Bulldogs",
-        "Stanford": "Stanford Cardinal",
-      };
+      const dk = dateKey(m.commence);
+      const awayN = normalizeName(m.away || "");
+      const homeN = normalizeName(m.home || "");
 
-      const idx = {};
-      let countEvents = 0;
+      if (awayN && homeN) {
+        idx[`k:${awayN}@${homeN}@${dk}`] = idx[`eid:${m.id}`];
+        idx[`k:${homeN}@${awayN}@${dk}`] = idx[`eid:${m.id}`];
+        idx[`kany:${awayN}@${homeN}`] = idx[`eid:${m.id}`];
+        idx[`kany:${homeN}@${awayN}`] = idx[`eid:${m.id}`];
+      }
+      if (awayN) {
+        idx[`team:${awayN}@${dk}`] = idx[`eid:${m.id}`];
+        idx[`teamany:${awayN}`] = idx[`eid:${m.id}`];
+      }
+      if (homeN) {
+        idx[`team:${homeN}@${dk}`] = idx[`eid:${m.id}`];
+        idx[`teamany:${homeN}`] = idx[`eid:${m.id}`];
+      }
 
-      for (const j of jsons) {
-        if (!j || !Array.isArray(j.events)) continue;
+      for (const t of new Set([...tokensOf(m.away || ""), ...tokensOf(m.home || "")])) {
+        idx[`tok:${t}@${dk}`] = idx[`eid:${m.id}`];
+        idx[`tokany:${t}`] = idx[`eid:${m.id}`];
+      }
+    };
 
-        for (const ev of j.events) {
-          const comp = ev.competitions?.[0];
-          if (!comp || !Array.isArray(comp.competitors) || comp.competitors.length < 2) continue;
-
-          const a = comp.competitors.find((c) => c.homeAway === "away");
-          const h = comp.competitors.find((c) => c.homeAway === "home");
-          if (!a || !h) continue;
-
-          // Names
-          const awayRaw =
-            a.team?.displayName || a.team?.shortDisplayName || a.team?.name;
-          const homeRaw =
-            h.team?.displayName || h.team?.shortDisplayName || h.team?.name;
-          if (!awayRaw || !homeRaw) continue;
-
-          // Normalize through aliases
-          const away = TEAM_ALIASES[awayRaw] || awayRaw;
-          const home = TEAM_ALIASES[homeRaw] || homeRaw;
-
-          // Scores/meta
-          const awayScore = Number(a.score ?? NaN);
-          const homeScore = Number(h.score ?? NaN);
-          const commence = ev.date || comp.date;
-          const completed = !!comp.status?.type?.completed;
-          const league = (ev.leagues?.[0]?.abbreviation || "").toUpperCase() || "NCAA";
-
-          const meta = {
-            id: ev.id,
-            league,
-            away,
-            home,
-            awayScore: Number.isFinite(awayScore) ? awayScore : undefined,
-            homeScore: Number.isFinite(homeScore) ? homeScore : undefined,
-            commence,
-            completed,
-          };
-
-// 1) event id (odds-api id)
-idx[`eid:${meta.id}`] = meta;
-
-// 2) cross-provider team+date keys (away@home@YYYY-MM-DD)
-const k1 = `k:${normName(away)}@${normName(home)}@${dateKey(meta.commence)}`;
-const k2 = `k:${normName(home)}@${normName(away)}@${dateKey(meta.commence)}`;
-idx[k1] = meta;
-idx[k2] = meta;
-
-// 3) legacy name fallbacks
-idx[away] = meta;
-idx[home] = meta;
-
-
-countEvents++;
-
+    async function fetchSummaryAnyLeague(id) {
+      const sports = ["college-football", "nfl"];
+      const bases = ["apis/site/v2", "apis/v2"];
+      for (const sport of sports) {
+        for (const base of bases) {
+          try {
+            const url = `https://site.api.espn.com/${base}/sports/football/${sport}/summary?event=${id}`;
+            const r = await fetch(url);
+            if (!r.ok) continue;
+            const j = await r.json();
+            const comp = j?.header?.competitions?.[0] || j?.competitions?.[0] || {};
+            const cs = comp?.competitors || [];
+            const awayC = cs.find((c) => c.homeAway === "away");
+            const homeC = cs.find((c) => c.homeAway === "home");
+            if (!awayC || !homeC) continue;
+            const meta = {
+              id: String(id),
+              away: awayC?.team?.displayName || awayC?.team?.name || null,
+              home: homeC?.team?.displayName || homeC?.team?.name || null,
+              awayScore: Number(awayC?.score ?? NaN),
+              homeScore: Number(homeC?.score ?? NaN),
+              commence:
+                comp?.date || j?.gameInfo?.game?.date || j?.header?.competitions?.[0]?.date || null,
+              completed: !!(comp?.status?.type?.completed),
+            };
+            if (Number.isNaN(meta.awayScore)) delete meta.awayScore;
+            if (Number.isNaN(meta.homeScore)) delete meta.homeScore;
+            addMeta(meta);
+            return;
+          } catch {}
         }
       }
-
-      if (!stop) {
-        setGamesIndex(idx);
-        console.log("gamesIndex keys:", Object.keys(idx));
-
-        setScoresError(null);
-        console.log("ESPN events indexed:", countEvents, "teams:", Object.keys(idx).length);
-      }
-    } catch (e) {
-      if (!stop) setScoresError(String(e?.message || e));
-    }
-  }
-
-  fetchEspnScores();
-  const t = setInterval(fetchEspnScores, 60_000);
-  return () => {
-    stop = true;
-    clearInterval(t);
-  };
-}, [week]);
-
-
-
-
-  /** Build per-user picks STRICTLY by slot:
-   *  - Slot A -> left column ("College Pick")
-   *  - Slot B -> right column ("Pro Pick")
-   *    (In Week 1, B will still be NCAA, which is fine.)
-   */
-  const picks = useMemo(() => {
-    const byUser = new Map();
-
-    for (const r of dbPicks ?? []) {
-      const uid = String(r.user_id).toLowerCase();
-      if (!byUser.has(uid)) {
-        byUser.set(uid, {
-          player: DISPLAY_NAME[uid] || titleCase(uid),
-          A: null,
-          B: null,
-        });
-      }
-
-      // prefer text slot; fallback to numeric pick_slot
-      const ab = r.slot ?? (r.pick_slot === 1 ? "A" : r.pick_slot === 2 ? "B" : null);
-      if (!ab) continue;
-
-      const upperBonus = String(r.bonus || "").toUpperCase();
-      const pickObj = {
-  team: r.team,
-  line: r.spread ? (r.spread > 0 ? `+${r.spread}` : `${r.spread}`) : "",
-  loy: (r.bonus || "").includes("LOY"),
-  loq: (r.bonus || "").includes("LOQ"),
-  dog: (r.bonus || "").includes("DOG"),
-  press: !!r.pressed,
-  league: r.league,
-
-  // 🔑 carry through the ESPN fields from Supabase
-  espn_event_id: r.espn_event_id || null,
-  espn_home: r.espn_home || null,
-  espn_away: r.espn_away || null,
-  espn_commence: r.espn_commence || null,
-};
-
-
-      if (ab === "A") byUser.get(uid).A = pickObj;
-      if (ab === "B") byUser.get(uid).B = pickObj;
     }
 
-    return Array.from(byUser.values()).sort((a, b) => a.player.localeCompare(b.player));
-  }, [dbPicks]);
+    // 1) Exact matches by espn_event_id
+    const eventIds = Array.from(
+      new Set((dbPicks || []).map((p) => p?.espn_event_id).filter(Boolean).map(String))
+    );
+    await Promise.all(eventIds.map((id) => fetchSummaryAnyLeague(id)));
 
-  // Compute rows with live score lookup per team, plus bonuses
-  const rows = useMemo(() => {
-    return picks
-      .map((p) => {
-        const aTeam = p.A?.team ? (NAME_ALIAS[p.A.team] || p.A.team) : null;
-const bTeam = p.B?.team ? (NAME_ALIAS[p.B.team] || p.B.team) : null;
-// prefer event id; fall back to name (with alias)
-const aKey = p.A
-  ? (p.A.espn_event_id
-      ? `eid:${p.A.espn_event_id}`
-      : (NAME_ALIAS[p.A.team] || p.A.team))
-  : null;
-const bKey = p.B
-  ? (p.B.espn_event_id
-      ? `eid:${p.B.espn_event_id}`
-      : (NAME_ALIAS[p.B.team] || p.B.team))
-  : null;
+    // 2) Scoreboard sweep across derived window (start..end)
+    const days = [];
+    const s = new Date(start), e = new Date(end);
+    for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      days.push(`${y}${m}${dd}`);
+    }
+    const mk = (base, sport) =>
+      days.map((d) => `https://site.api.espn.com/${base}/sports/football/${sport}/scoreboard?dates=${d}`);
+    const urls = [
+      ...mk("apis/site/v2", "college-football"),
+      ...mk("apis/site/v2", "nfl"),
+      ...mk("apis/v2", "college-football"),
+      ...mk("apis/v2", "nfl"),
+    ];
 
-// --- College pick meta ---
-// --- College pick meta ---
-const aIdKey   = p.A?.espn_event_id ? `eid:${p.A.espn_event_id}` : null;
-const aTeamsKey= (p.A?.espn_away && p.A?.espn_home && p.A?.espn_commence)
-  ? `k:${normName(p.A.espn_away)}@${normName(p.A.espn_home)}@${dateKey(p.A.espn_commence)}`
-  : null;
+    const jsons = await Promise.all(
+      urls.map((u) => fetch(u).then((r) => (r.ok ? r.json() : null)).catch(() => null))
+    );
 
-const aMeta =
-  (aIdKey && gamesIndex[aIdKey]) ||
-  (aTeamsKey && gamesIndex[aTeamsKey]) ||
-  findByTeamOnDate(gamesIndex, NAME_ALIAS[p.A?.team] || p.A?.team, p.A?.espn_commence || week?.start_date) ||
-  (p.A ? gamesIndex[p.A.team] : null);
-
-// --- Pro pick meta ---
-const bIdKey   = p.B?.espn_event_id ? `eid:${p.B.espn_event_id}` : null;
-const bTeamsKey= (p.B?.espn_away && p.B?.espn_home && p.B?.espn_commence)
-  ? `k:${normName(p.B.espn_away)}@${normName(p.B.espn_home)}@${dateKey(p.B.espn_commence)}`
-  : null;
-
-const bMeta =
-  (bIdKey && gamesIndex[bIdKey]) ||
-  (bTeamsKey && gamesIndex[bTeamsKey]) ||
-  findByTeamOnDate(gamesIndex, NAME_ALIAS[p.B?.team] || p.B?.team, p.B?.espn_commence || week?.start_date) ||
-  (p.B ? gamesIndex[p.B.team] : null);
-// --- Askip calculations ---
-const aAskip = p.A ? calcAskip({
-  teamName: NAME_ALIAS[p.A.team] || p.A.team,
-  spread: p.A.num_line,
-  meta: aMeta,
-  pick: p.A
-}) : 0;
-
-const bAskip = p.B ? calcAskip({
-  teamName: NAME_ALIAS[p.B.team] || p.B.team,
-  spread: p.B.num_line,
-  meta: bMeta,
-  pick: p.B
-}) : 0;
-// Per-pick game facts (used for bonuses)
-const aFacts = p.A
-  ? gameFacts(aMeta, NAME_ALIAS[p.A.team] || p.A.team, p.A.line ?? p.A.num_line)
-  : null;
-
-const bFacts = p.B
-  ? gameFacts(bMeta, NAME_ALIAS[p.B.team] || p.B.team, p.B.line ?? p.B.num_line)
-  : null;
-
-console.log("Askip Debug", {
-  user: p.user_id,
-  teamA: p.A?.team,
-  teamB: p.B?.team,
-  aMeta,
-  bMeta,
-  aAskip,
-  bAskip
-});
-
-
-
-
-
-
-        const aRes = coverageForPick(aMeta, p.A);
-        const bRes = coverageForPick(bMeta, p.B);
-
-        const bonuses = {
-          dog:   (p.A?.dog && aRes.ok === true) || (p.B?.dog && bRes.ok === true),
-          sweep: aRes.ok === true && bRes.ok === true,
-          reverseSweep: aRes.ok === false && bRes.ok === false,
-          // keep quigger/reverseQuigger wiring here if/when you add the logic
+    for (const j of jsons) {
+      if (!j || !Array.isArray(j.events)) continue;
+      for (const ev of j.events) {
+        const comp = ev.competitions?.[0];
+        if (!comp || !Array.isArray(comp.competitors) || comp.competitors.length < 2) continue;
+        const awayC = comp.competitors.find((c) => c.homeAway === "away");
+        const homeC = comp.competitors.find((c) => c.homeAway === "home");
+        const meta = {
+          id: String(ev.id),
+          away: awayC?.team?.displayName || awayC?.team?.name || null,
+          home: homeC?.team?.displayName || homeC?.team?.name || null,
+          awayScore: Number(awayC?.score ?? NaN),
+          homeScore: Number(homeC?.score ?? NaN),
+          commence: ev.date || comp.date || null,
+          completed: !!(comp.status?.type?.completed),
         };
+        if (Number.isNaN(meta.awayScore)) delete meta.awayScore;
+        if (Number.isNaN(meta.homeScore)) delete meta.homeScore;
+        addMeta(meta);
+      }
+    }
 
-        const total$ = aRes.dollars + bRes.dollars + bonusTotal(bonuses);
+    setGamesIndex(idx);
+    // also write/refresh scores in Supabase so payouts update automatically
+try {
+  // de-dup metas by id
+  const metas = Array.from(
+    new Map(
+      Object.values(idx)
+        .filter(m => m && m.id)
+        .map(m => [String(m.id), m])
+    ).values()
+  );
 
-        return {
-  player: p.player,
-  college: { meta: aMeta, pick: p.A, res: aRes },
-  pro:     { meta: bMeta, pick: p.B, res: bRes },
-  total$,
-  aAskip,
-  bAskip,
+  const leagueById = new Map(
+    (dbPicks || [])
+      .filter(p => p?.espn_event_id)
+      .map(p => [String(p.espn_event_id), p.league])
+  );
 
-  // initialize/keep bonuses on the row
-  bonuses: [],        // ← keep just this (remove the earlier `bonuses,`)
-  bonusesTotal: 0,
-
-  // facts used later for bonus logic
-  _facts: {
-    a: aFacts,
-    b: bFacts,
-
-    // Dog bonus: must be tagged dog, be +7 or more, and win outright
-    aDogWin: !!(aFacts && dogBonusHit(p.A, aFacts)),
-    bDogWin: !!(bFacts && dogBonusHit(p.B, bFacts)),
-
-    // Goose / Cooked Goose
-    aGoose:  !!(aFacts?.shutFor),
-    bGoose:  !!(bFacts?.shutFor),
-    aCooked: !!(aFacts && aFacts.shutAgainst && aFacts.isFav && Math.abs(aFacts.line) >= 2),
-    bCooked: !!(bFacts && bFacts.shutAgainst && bFacts.isFav && Math.abs(bFacts.line) >= 2),
-  },
-};
-
-
-      })
-      .sort((a, b) => b.total$ - a.total$);
-  }, [picks, gamesIndex]);
-// --- Balance dollars by cohort ---
-function applyDollarBalancing(rows) {
-  const RATE = 0.3125;
-
-  function balanceDollars(askips) {
-    const total = askips.reduce((a, b) => a + b, 0);
-    return askips.map(a => (6 * a - total) * RATE);
-  }
-
-  // collect askips
-  const collegeAskip = rows.map(r => r.aAskip || 0);
-  const proAskip = rows.map(r => r.bAskip || 0);
-
-  // compute balanced dollars
-  const collegeDollars = balanceDollars(collegeAskip);
-  const proDollars = balanceDollars(proAskip);
-
-  // return rows with new fields
-  return rows.map((r, i) => ({
-    ...r,
-    collegeDollar: collegeDollars[i],
-    proDollar: proDollars[i],
+  const rows = metas.map(m => ({
+    espn_event_id: String(m.id),                                 // PK
+    league: leagueById.get(String(m.id)) || null,                // NCAA / NFL if known
+    week_id: weekId,                                             // current week
+    away: m.away || null,
+    home: m.home || null,
+    commence: m.commence ? new Date(m.commence).toISOString() : null,
+    away_score: Number.isFinite(m.awayScore) ? m.awayScore : null,
+    home_score: Number.isFinite(m.homeScore) ? m.homeScore : null,
+    completed: !!m.completed,
+    updated_at: new Date().toISOString(),
   }));
+
+  if (rows.length) {
+    await supabase.from("game_scores").upsert(rows, { onConflict: "espn_event_id" });
+  }
+} catch (e) {
+  console.error("game_scores upsert error", e);
 }
 
-
-
-const balancedRows = applyDollarBalancing(rows);
-// --- Aggregate bonuses and roll them into each row ---
-function applyBonuses(rows) {
-  // 1) Per-pick bonuses (Dog, Goose, Cooked Goose)
-  const perPick = rows.map(r => {
-    const labels = [];
-    let total = r.bonusesTotal || 0;
-
-    if (r._facts?.aDogWin) { labels.push("Dog"); total += BONUS_AMT.DOG; }
-    if (r._facts?.bDogWin) { labels.push("Dog"); total += BONUS_AMT.DOG; }
-
-    if (r._facts?.aGoose)  { labels.push("Goose"); total += BONUS_AMT.GOOSE; }
-    if (r._facts?.bGoose)  { labels.push("Goose"); total += BONUS_AMT.GOOSE; }
-
-    if (r._facts?.aCooked) { labels.push("Cooked Goose"); total += BONUS_AMT.COOKED_GOOSE; }
-    if (r._facts?.bCooked) { labels.push("Cooked Goose"); total += BONUS_AMT.COOKED_GOOSE; }
-
-    return { ...r, bonuses: [...(r.bonuses || []), ...labels], bonusesTotal: total };
-  });
-
-  // 2) Slot-level sweeps (college / pro)
-  const aCovers = perPick.map(r => r._facts?.a?.covered === true);
-  const bCovers = perPick.map(r => r._facts?.b?.covered === true);
-
-  function applySweep(rows, covers) {
-    const winners = covers.filter(Boolean).length;
-    const losers  = covers.filter(v => v === false).length;
-
-    return rows.map((r, i) => {
-      let labels = r.bonuses ? [...r.bonuses] : [];
-      let total  = r.bonusesTotal || 0;
-
-      if (winners === 1 && covers[i] === true)  { labels.push("Sweep");         total += BONUS_AMT.SWEEP; }
-      if (losers  === 1 && covers[i] === false) { labels.push("Reverse Sweep"); total += BONUS_AMT.REVERSE_SWEEP; }
-
-      return { ...r, bonuses: labels, bonusesTotal: total };
+    setGamesBuiltFor({
+      uids: (dbPicks || []).length,
+      range: `${dateKey(start)}..${dateKey(end)}`,
     });
   }
 
-  const afterA = applySweep(perPick, aCovers);
-  const afterB = applySweep(afterA, bCovers);
+  build();
+  return () => { stop = true; };
+}, [dbPicks]);
 
-// 3) League-wide (Quigger / Reverse Quigger) — with distribution + labels
-const bothWon  = afterB.map(r => (r._facts?.a?.covered === true)  && (r._facts?.b?.covered === true));
-const bothLost = afterB.map(r => (r._facts?.a?.covered === false) && (r._facts?.b?.covered === false));
 
-const bothWonCnt  = bothWon.filter(Boolean).length;
-const bothLostCnt = bothLost.filter(Boolean).length;
+  /* ===== rows with a single cached match per pick ===== */
+  const rows = useMemo(() => {
+    matchCacheRef.current.clear();
 
-const n = afterB.length;
-const quiggerIdx  = bothLostCnt  === 1 ? bothLost.indexOf(true) : -1;  // the one who lost both
-const rQuiggerIdx = bothWonCnt   === 1 ? bothWon.indexOf(true)  : -1;  // the one who won both
-
-const final = afterB.map((r, i) => {
-  let labels = r.bonuses ? [...r.bonuses] : [];
-  let total  = r.bonusesTotal || 0;
-
-  // Quigger: trigger pays 46.88; everyone else receives 46.88/(n-1)
-  if (quiggerIdx !== -1) {
-    if (i === quiggerIdx) {
-      if (!labels.includes("Quigger")) labels.push("Quigger");
-      total += BONUS_AMT.QUIGGER; // -46.88
-    } else {
-      total += Math.abs(BONUS_AMT.QUIGGER) / (n - 1); // e.g. +9.38 with 6 players
+    const dollars = {};
+    for (const r of wr || []) {
+      dollars[String(r.user_id).toLowerCase()] = {
+        collegeDollar: Number(r.college_dollars || 0),
+        proDollar: Number(r.pro_dollars || 0),
+        weekTotal: Number(r.week_total || 0),
+      };
     }
-  }
 
-  // Reverse Quigger: trigger receives 46.88; everyone else pays 46.88/(n-1)
-  if (rQuiggerIdx !== -1) {
-    if (i === rQuiggerIdx) {
-      if (!labels.includes("Reverse Quigger")) labels.push("Reverse Quigger");
-      total += BONUS_AMT.REVERSE_QUIGGER; // +46.88
-    } else {
-      total -= BONUS_AMT.REVERSE_QUIGGER / (n - 1);   // e.g. -9.38 with 6 players
+    const byUser = new Map();
+    for (const r of dbPicks || []) {
+      const uid = String(r.user_id || "").trim().toLowerCase();
+
+      if (!byUser.has(uid)) byUser.set(uid, { player: titleCase(uid), A: null, B: null, ...dollars[uid] });
+      let ab = r.slot ?? (r.pick_slot === 1 ? "A" : r.pick_slot === 2 ? "B" : null);
+if (!ab) ab = r.league === "NCAA" ? "A" : (r.league === "NFL" ? "B" : null);
+if (!ab) continue;
+
+
+      const badgeStr = (r.bonus || "").toString().toUpperCase();
+      const badges = [];
+      if (badgeStr.includes("DOG")) badges.push("DOG");
+      if (badgeStr.includes("LOQ")) badges.push("LOQ");
+      if (badgeStr.includes("LOY")) badges.push("LOY");
+      if (badgeStr.includes("GOOSE")) badges.push("GOOSE");
+      if (badgeStr.includes("COOKED GOOSE")) badges.push("COOKED GOOSE");
+      if (r.pressed) badges.push("PRESS");
+
+      const pick = {
+        team: r.team,
+        line: Number.isFinite(r.spread) ? (r.spread > 0 ? `+${r.spread}` : `${r.spread}`) : "",
+        spreadNum: Number.isFinite(r.spread) ? Number(r.spread) : 0,
+        badges,
+        league: r.league,
+        espn_event_id: r.espn_event_id || null,
+        espn_home: r.espn_home || null,
+        espn_away: r.espn_away || null,
+        espn_commence: r.espn_commence || null,
+        slot: ab,
+        userKey: uid,
+      };
+      if (ab === "A") byUser.get(uid).A = pick;
+      if (ab === "B") byUser.get(uid).B = pick;
     }
-  }
 
-  return { ...r, bonuses: labels, bonusesTotal: total };
-});
-
-return final;
-
-
-
-}
-
-const finalRows = applyBonuses(balancedRows);
-function rowTotal(r) {
-  return Number(r.collegeDollar || 0) +
-         Number(r.proDollar || 0) +
-         Number(r.bonusesTotal || 0);
-}
-
-// attach a computed total and sort by it (desc)
-const finalRowsSorted = applyBonuses(balancedRows)
-  .map(r => ({ ...r, weekTotal: rowTotal(r) }))
-  .sort((a, b) => b.weekTotal - a.weekTotal);
-
-  return (
-    <div style={page}>
-      <div style={pageHeader}>
-        <h1 style={title}>SAC Pick’Em</h1>
-      </div>
-<div style={{ display: "flex", gap: 8, alignItems: "center", margin: "8px 0" }}>
-  <button
-    onClick={async () => {
-      try {
-        const weekId  = week?.id ?? 0;
-const quarter = week?.quarter ?? "Q1";
-const label   = week?.label ?? "W1";
-
-
-        const snapshot = buildWeekSnapshot(finalRowsSorted, { weekId, quarter, label });
-
-        if (Math.abs(Number(snapshot.sum)) > 0.02) {
-          alert(`Totals are not balanced (sum = ${snapshot.sum}). Fix before saving.`);
-          return;
-        }
-
-        const { data, error } = await supabase
-          .from("week_snapshots")
-          .upsert(
-            {
-              week_id: weekId,
-              quarter,
-              label,
-              payload: snapshot.rows,
-              sum_check: snapshot.sum,
-              status: "PENDING"
-            },
-            { onConflict: "week_id" }
-          )
-          .select()
-          .single();
-
-        if (error) throw error;
-        alert("Snapshot saved for scheduler ✅");
-        console.log("week_snapshots upsert:", data);
-      } catch (err) {
-        console.error(err);
-        alert(`Save failed: ${err.message || err}`);
-      }
-    }}
-    style={{ padding: "6px 10px", fontWeight: 600 }}
-  >
-    <button
-  onClick={async () => {
-    try {
-      const weekId = week?.id ?? 0;
-
-      // 1) Load the saved snapshot for this week
-      const { data: snap, error: readErr } = await supabase
-        .from("week_snapshots")
-        .select("*")
-        .eq("week_id", weekId)
-        .single();
-
-      if (readErr) throw readErr;
-      if (!snap) {
-        alert("No snapshot found for this week. Save one first.");
-        return;
-      }
-      if (snap.status === "COMMITTED") {
-        alert("This snapshot is already committed.");
-        return;
-      }
-
-      // Optional sanity
-      if (Math.abs(Number(snap.sum_check || 0)) > 0.02) {
-        alert(`Snapshot not balanced (sum = ${snap.sum_check}). Fix before committing.`);
-        return;
-      }
-
-      // 2) Commit it to weekly_results + quarter_standings
-      const { data, error } = await supabase.rpc("finalize_week", {
-        p_week_id: snap.week_id,
-        p_quarter: snap.quarter,
-        p_rows: snap.payload,          // the rows array we stored
-        p_require_balanced: true
+    const findMetaOnce = (p) => {
+      if (!p) return null;
+      const cacheKey = JSON.stringify({
+        u: p.userKey, s: p.slot, t: normalizeName(p.team || ""),
+        e: p.espn_event_id || "", d: p.espn_commence ? dateKey(p.espn_commence) : "",
       });
-      if (error) throw error;
+      const cache = matchCacheRef.current;
+      if (cache.has(cacheKey)) return cache.get(cacheKey);
 
-      // 3) Mark snapshot committed
-      const { error: updErr } = await supabase
-        .from("week_snapshots")
-        .update({ status: "COMMITTED", committed_at: new Date().toISOString() })
-        .eq("week_id", snap.week_id);
-      if (updErr) throw updErr;
+      const inWindow = (m) => {
+        if (!m?.commence || !weekMeta?.start_date || !weekMeta?.end_date) return 0;
+        const t = new Date(m.commence).getTime();
+        return t >= new Date(weekMeta.start_date).getTime() &&
+               t <= new Date(weekMeta.end_date).getTime() ? 1 : 0;
+      };
 
-      alert("Committed to standings ✅");
-      console.log("finalize_week result:", data);
-    } catch (err) {
-      console.error(err);
-      alert(`Commit failed: ${err.message || err}`);
-    }
-  }}
-  style={{ padding: "6px 10px", fontWeight: 600 }}
->
-  Commit Saved Snapshot
-</button>
+      let best = null; let bestScore = -1;
+      const consider = (m, scoreBase) => {
+        if (!m) return;
+        const bonus = inWindow(m);
+        const score = (scoreBase ?? 0) + bonus * 0.25;
+        if (score > bestScore) { bestScore = score; best = m; }
+      };
 
-    Save Snapshot (for scheduler)
-  </button>
-</div>
+      if (p.espn_event_id && gamesIndex[`eid:${p.espn_event_id}`]) consider(gamesIndex[`eid:${p.espn_event_id}`], 10);
 
-      <div style={container}>
-        <h2 style={sectionTitle}>
-  Week {week?.number || "—"} Summary {week?.status ? `(${week.status})` : ""}
-</h2>
+      if ((p.espn_away || p.espn_home) && p.espn_commence) {
+        const dk = dateKey(p.espn_commence);
+        const awayN = normalizeName(p.espn_away || "");
+        const homeN = normalizeName(p.espn_home || "");
+        consider(gamesIndex[`k:${awayN}@${homeN}@${dk}`], 8);
+        consider(gamesIndex[`k:${homeN}@${awayN}@${dk}`], 8);
+      }
 
-        {scoresError && (
-          <div style={{ margin: "6px 0 10px", color: "#b42318", fontSize: 12 }}>
-            Live scores error: {scoresError}
-          </div>
-        )}
+      if (p.espn_away || p.espn_home) {
+        const awayN = normalizeName(p.espn_away || "");
+        const homeN = normalizeName(p.espn_home || "");
+        consider(gamesIndex[`kany:${awayN}@${homeN}`], 6);
+        consider(gamesIndex[`kany:${homeN}@${awayN}`], 6);
+      }
 
-        <div style={card}>
-          {/* Header */}
-          <div style={tableHead}>
-            <div style={{ ...th, flex: 2 }}>Player</div>
+      if (p.espn_commence) {
+        const dk = dateKey(p.espn_commence);
+        const tNorm = normalizeName(p.team || "");
+        consider(gamesIndex[`team:${tNorm}@${dk}`], 5);
+        for (const t of tokensOf(p.team || "")) consider(gamesIndex[`tok:${t}@${dk}`], 5);
+      }
 
-            {/* College (slot A) */}
-            <div style={{ ...th, flex: 3, textAlign: "left" }}>College Pick</div>
-            <div style={{ ...th, width: WIDTH_PTS, textAlign: "center" }}>Pts ±</div>
-            <div style={{ ...th, width: WIDTH_MNY, textAlign: "center" }}>$ ±</div>
+      consider(gamesIndex[`teamany:${normalizeName(p.team || "")}`], 3);
+      for (const t of tokensOf(p.team || "")) consider(gamesIndex[`tokany:${t}`], 3);
 
-            {/* Pro / Week 1 second college shows here (slot B) */}
-            <div style={{ ...th, flex: 3, textAlign: "left" }}>Pro Pick</div>
-            <div style={{ ...th, width: WIDTH_PTS, textAlign: "center" }}>Pts ±</div>
-            <div style={{ ...th, width: WIDTH_MNY, textAlign: "center" }}>$ ±</div>
+      if (!best) {
+        const seen = new Set();
+        for (const k in gamesIndex) {
+          const m = gamesIndex[k];
+          if (!m || seen.has(m.id)) continue;
+          seen.add(m.id);
+          const s = Math.max(similar(p.team || "", m.home || ""), similar(p.team || "", m.away || ""));
+          consider(m, s);
+        }
+      }
 
-            {/* Bonuses & Total */}
-            <div style={{ ...th, flex: 2 }}>Bonuses</div>
-            <div style={{ ...th, width: 160, textAlign: "center" }}>Week Total</div>
-          </div>
+      cache.set(cacheKey, best || null);
+      return best || null;
+    };
 
-          {/* Rows */}
-          {finalRowsSorted.map((r, i) => (
+    const resultLine = (p) => {
+      const g = findMetaOnce(p);
+      const away = g?.away || p?.espn_away || "—";
+      const home = g?.home || p?.espn_home || "—";
+      const aS = g?.awayScore, hS = g?.homeScore;
+      const score = Number.isFinite(aS) && Number.isFinite(hS) ? `${aS}-${hS}` : "—";
+      return `${away} @ ${home} — ${score}${g?.completed ? " (FT)" : ""}`;
+    };
 
+    const coverPts = (p) => {
+      const g = findMetaOnce(p);
+      if (!g || !Number.isFinite(g.awayScore) || !Number.isFinite(g.homeScore)) return null;
+      const isAway = similar(p?.team || "", g.away || "") >= similar(p?.team || "", g.home || "");
+      const my = isAway ? g.awayScore : g.homeScore;
+      const opp = isAway ? g.homeScore : g.awayScore;
+      const line = Number.isFinite(p?.spreadNum) ? p.spreadNum : 0;
+      return my + line - opp;
+    };
 
-  <div
-    key={r.player}
-    style={{
-      ...tr,
-      background: i % 2 ? "#ffffff" : "#fabff"
-    }}
-  >
-    {/* Player name */}
-    <div style={{ ...td, flex: 2, fontWeight: 700 }}>{r.player}</div>
+    const list = Array.from(byUser.values()).map((u) => {
+      const cPts = coverPts(u.A);
+      const pPts = coverPts(u.B);
+      const bonusLabels = [];
+      let bonusTotal = 0;
+      if (cPts != null && pPts != null) {
+        if (cPts > 0 && pPts > 0) { bonusLabels.push("Reverse Quigger"); bonusTotal += 56.26; }
+        if (cPts < 0 && pPts < 0) { bonusLabels.push("Quigger");         bonusTotal -= 56.26; }
+      }
+      return {
+        player: u.player,
+        collegePick: u.A || null,
+        proPick: u.B || null,
+        collegeResult: resultLine(u.A),
+        proResult: resultLine(u.B),
+        collegePts: cPts,
+        proPts: pPts,
+        collegeDollar: u.collegeDollar ?? 0,
+        proDollar: u.proDollar ?? 0,
+        bonusesLabels: bonusLabels,
+        bonusesTotal: bonusTotal,
+        weekTotal: u.weekTotal ?? (u.collegeDollar || 0) + (u.proDollar || 0),
+      };
+    });
 
-   {/* College (A) */}
-<div style={{ ...td, flex: 3 }}>
-  <PickCell meta={r.college.meta} pick={r.college.pick} res={r.college.res} />
-</div>
-<div style={{ ...td, width: WIDTH_PTS, justifyContent: "center" }}>
-<span style={{ ...ptsStyle(r.college.res.ok), fontSize: 14 }}>
-  {ptsFmt(r.college.res.pts)}
-</span>
+    list.sort((a, b) => {
+      const diff = (b.weekTotal ?? 0) - (a.weekTotal ?? 0);
+      if (diff !== 0) return diff;
+      return String(a.player || "").localeCompare(String(b.player || ""));
+    });
 
-</div>
-<div style={{ ...td, width: WIDTH_MNY, justifyContent: "center" }}>
-  <span style={{ ...moneyStyle(r.collegeDollar), fontSize: 14 }}>
-  {(Number(r.collegeDollar || 0) >= 0 ? "+$" : "-$") +
-    Math.abs(Number(r.collegeDollar || 0)).toFixed(2)}
-</span>
+    return list;
+  }, [wr, dbPicks, gamesIndex, weekMeta?.start_date, weekMeta?.end_date]);
 
+  const onSelectWeek = (e) => {
+    const wid = Number(e.target.value);
+    const sp = new URLSearchParams(window.location.search);
+    sp.set("week", String(wid));
+    window.location.search = sp.toString();
+  };
 
+  /* ===== styles ===== */
+  const S = {
+    page: { minHeight: "100vh", background: "#f5f7fb", color: "#0f172a", fontFamily: "system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif" },
+    header: { background: "#0b2148", color: "#fff", padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" },
+    h1: { margin: 0, fontSize: 18, fontWeight: 800 },
+    tag: (locked) => ({ marginLeft: 8, fontSize: 11, padding: "2px 8px", borderRadius: 999, background: locked ? "#ecfeff" : "#eef2ff", color: locked ? "#155e75" : "#3730a3", fontWeight: 800 }),
+    dropdown: { fontSize: 13, padding: "6px 8px", borderRadius: 6, border: "1px solid #c7d2fe", background: "#eef2ff", color: "#1e1b4b", fontWeight: 700 },
+    container: { maxWidth: 1200, margin: "16px auto", padding: "0 12px" },
+    card: { border: "1px solid #dce6f5", background: "#fff", borderRadius: 10, overflow: "hidden", boxShadow: "0 1px 2px rgba(0,0,0,0.03)" },
+    headRow: { display: "flex", background: "#eaf0fe", padding: "10px 12px", fontSize: 13, fontWeight: 800, color: "#0b2148", borderBottom: "1px solid #dce6f5"
+ },
+    row: { display: "flex", alignItems: "stretch", borderTop: "1px solid #eef2f7" },
+    cell: { padding: "12px 8px", display: "flex", alignItems: "center" },
+    player: { flex: 2, minWidth: 140, borderRight: "1px solid #e5e7eb" },
+    collegePick: { flex: 3, background: "#f8fafc" },
+    collegeStat: { width: 90, justifyContent: "center", background: "#f8fafc", borderRight: "1px solid #e5e7eb" },
+    proPick: { flex: 3, background: "#f6f7fb" },
+    proStat: { width: 90, justifyContent: "center", background: "#f6f7fb", borderRight: "1px solid #e5e7eb" },
+    bonus: { flex: 2, borderRight: "1px solid #e5e7eb" },
+    total: { width: 140, justifyContent: "center" },
+    pickTitle: { fontWeight: 700, fontSize: 13, lineHeight: 1.15, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },
+    pickSub: { fontSize: 11, color: "#64748b", marginTop: 2 },
+    statCol: { display: "flex", flexDirection: "column", alignItems: "center", lineHeight: 1.05 },
+    statPts: (ok) => ({ fontWeight: 800, fontSize: 12, color: okColor(ok) }),
+    statMoney: (n) => ({ fontWeight: 900, fontSize: 14, color: moneyColor(n) }),
+    badge: (k) => ({
+      fontSize: 10, fontWeight: 900, padding: "2px 6px", borderRadius: 999, border: "1px solid", lineHeight: 1,
+      color: k === "DOG" ? "#0f766e" : k === "LOQ" ? "#4c1d95" : k === "LOY" ? "#b45309" : k === "GOOSE" ? "#0f766e" : k === "COOKED GOOSE" ? "#b42318" : "#1f2937",
+      background: k === "DOG" ? "#ecfeff" : k === "LOQ" ? "#f5f3ff" : k === "LOY" ? "#fff7ed" : k === "GOOSE" ? "#ecfeff" : k === "COOKED GOOSE" ? "#fef2f2" : "#f1f5f9",
+      borderColor: k === "DOG" ? "#99f6e4" : k === "LOQ" ? "#ddd6fe" : k === "LOY" ? "#fed7aa" : k === "GOOSE" ? "#99f6e4" : k === "COOKED GOOSE" ? "#fecaca" : "#e5e7eb",
+    }),
+    bonusWrap: { display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%" },
+    bonusLabel: { display: "flex", flexDirection: "column", gap: 4 },
+    bonusName: { fontSize: 12, fontWeight: 600, color: "#3730a3" },
+    bonusMoney: (n) => ({ fontWeight: 900, fontSize: 14, color: moneyColor(n) }),
+    totalMoney: (n) => ({ fontWeight: 900, fontSize: 18, color: moneyColor(n) }),
+  };
 
-</div>
-
-{/* Pro (B) */}
-<div style={{ ...td, flex: 3 }}>
-  <PickCell meta={r.pro.meta} pick={r.pro.pick} res={r.pro.res} />
-</div>
-<div style={{ ...td, width: WIDTH_PTS, justifyContent: "center" }}>
-  <span style={{ ...ptsStyle(r.pro.res.ok), fontSize: 14 }}>
-  {ptsFmt(r.pro.res.pts)}
-</span>
-
-</div>
-<div style={{ ...td, width: WIDTH_MNY, justifyContent: "center" }}>
-  <span style={{ ...moneyStyle(r.proDollar), fontSize: 14 }}>
-  {(Number(r.proDollar || 0) >= 0 ? "+$" : "-$") +
-    Math.abs(Number(r.proDollar || 0)).toFixed(2)}
-</span>
-
-
-
-</div>
-
-{/* Bonuses */}
-<div style={{ ...td, flex: 2 }}>
-  <BonusesCell bonuses={r.bonuses} />
-</div>
-
-{/* Week total */}
-<div style={{ ...td, width: 160, justifyContent: "center" }}>
-<div style={{ ...td, width: WIDTH_MNY, justifyContent: "center" }}>
-  <span style={moneyStyle(r.weekTotal)}>
-    {(Number(r.weekTotal || 0) >= 0 ? "+$" : "-$") +
-      Math.abs(Number(r.weekTotal || 0)).toFixed(2)}
-  </span>
-</div>
-
-
-
-</div>
-
-  </div>
-))}
-
+  const PickCell = ({ pick, result }) => {
+    if (!pick) return <span style={{ color: "#94a3b8" }}>—</span>;
+    return (
+      <div style={{ display: "flex", flexDirection: "column" }}>
+        <div style={S.pickTitle}>
+          {pick.badges?.map((b, i) => (
+            <span key={i} style={S.badge(b)}>{b}</span>
+          ))}
+          <span>{pick.team} {pick.line || ""}</span>
         </div>
+        {result ? <div style={S.pickSub}>{result}</div> : null}
       </div>
+    );
+  };
+
+  const StatStack = ({ pts, dollars }) => (
+    <div style={S.statCol}>
+      <span style={S.statPts(pts > 0 ? true : pts < 0 ? false : null)}>{ptsFmt(pts)}</span>
+      <span style={S.statMoney(dollars)}>{fmtMoney(dollars)}</span>
     </div>
   );
-}
 
-/** ====== styles / cells ====== **/
-const WIDTH_PTS = 76;
-const WIDTH_MNY = 84;
-const numBase = { fontWeight: 900, fontSize: 18, textAlign: "center" };
-const ptsStyle = (ok) => ({ ...numBase, width: WIDTH_PTS, color: colorFor(ok) });
-const moneyStyle = (n) => ({ ...numBase, width: WIDTH_MNY, color: n > 0 ? "#067647" : n < 0 ? "#b42318" : "#475569" });
+  if (loading) return <div style={{ padding: 16 }}>Loading…</div>;
+  if (err) return <div style={{ padding: 16, color: "#b42318" }}>{err}</div>;
 
-const page = { minHeight: "100vh", background: "#f5f7fb", color: "#0f172a", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif" };
-const pageHeader = { background: "#0b2148", color: "#fff", padding: "10px 12px" };
-const title = { margin: 0, fontSize: 16, fontWeight: 700 };
-const container = { maxWidth: 1200, margin: "16px auto", padding: "0 12px" };
-const sectionTitle = { margin: "6px 0 12px", fontSize: 24, fontWeight: 800 };
-const card = { border: "1px solid #dce6f5", background: "#fff", borderRadius: 10, overflow: "hidden", boxShadow: "0 1px 2px rgba(0,0,0,0.03)" };
-const tableHead = { display: "flex", background: "#dfeeff", padding: "10px 12px", fontSize: 13, color: "#0b2148", fontWeight: 700 };
-const th = { padding: "0 8px" };
-const tr = { display: "flex", alignItems: "center", padding: "12px", borderTop: "1px solid #e8eef8", fontSize: 14 };
-const td = { padding: "0 8px", display: "flex", alignItems: "center" };
-
-const tagRow = { display: "inline-flex", gap: 6, alignItems: "center" };
-const tagPill = { display: "inline-block", padding: "2px 8px", borderRadius: 999, background: "#eef2ff", color: "#1f3a8a", fontSize: 11, fontWeight: 800, textTransform: "uppercase" };
-
-function PickCell({ meta, pick, res }) {
-  const ticket = pick ? `${pick.team} ${pick.line || ""}`.trim() : "—";
-  const tags = pickTagPills(pick);
   return (
-    <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.3 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-        {tags.length > 0 && (
-          <span style={tagRow}>
-            {tags.map((t) => (
-              <span key={t} style={tagPill}>{t}</span>
-            ))}
+    <div style={S.page}>
+      <div style={S.header}>
+        <h1 style={S.h1}>
+          Week Summary
+          <span style={S.tag(!!weekMeta?.is_locked)}>
+            {weekMeta?.is_locked ? (weekMeta?.label || `W${weekId}`) : "OPEN"}
           </span>
-        )}
-        <span style={{ fontWeight: 700, color: colorFor(res.ok) }}>{ticket}</span>
+        </h1>
+        <select aria-label="Select week" value={weekId || ""} onChange={onSelectWeek} style={S.dropdown}>
+          {(weekList || []).map((w) => (
+            <option key={w.week_id} value={w.week_id}>
+              {w.label || `W${w.week_id}`} {w.is_locked ? "" : " (OPEN)"}
+            </option>
+          ))}
+        </select>
       </div>
-      <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
-        {scoreline(meta)}
-      </div>
-    </div>
-  );
-}
 
-function BonusesCell({ bonuses }) {
-  // accept either an array of strings, or an object with a `labels` array
-  const names = Array.isArray(bonuses)
-    ? bonuses
-    : (Array.isArray(bonuses?.labels) ? bonuses.labels : []);
+      <div style={S.container}>
+        <div style={S.card}>
+          <div style={S.headRow}>
+            <div style={{ ...S.cell, ...S.player, fontWeight: 800 }}>Player</div>
+            <div style={{ ...S.cell, ...S.collegePick }}>College Pick</div>
+            <div style={{ ...S.cell, ...S.collegeStat, justifyContent: "center" }}>±</div>
+            <div style={{ ...S.cell, ...S.proPick }}>Pro Pick</div>
+            <div style={{ ...S.cell, ...S.proStat, justifyContent: "center" }}>±</div>
+            <div style={{ ...S.cell, ...S.bonus }}>Bonuses</div>
+            <div style={{ ...S.cell, ...S.total, justifyContent: "center" }}>Week Total</div>
+          </div>
 
-  if (!names.length) {
-    return <span style={{ color: "#94a3b8" }}>—</span>;
-  }
+          {rows.map((r, i) => (
+            <div key={r.player} style={{ ...S.row, background: i % 2 ? "#ffffff" : "#fbfdff" }}>
+              <div style={{ ...S.cell, ...S.player, fontWeight: 700 }}>{r.player}</div>
 
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      {names.map((n, i) => (
-        <div key={i} style={{ fontSize: 13, fontWeight: 600, color: "#3730a3" }}>
-          {n}
+              <div style={{ ...S.cell, ...S.collegePick }}>
+                <PickCell pick={r.collegePick} result={r.collegeResult} />
+              </div>
+              <div style={{ ...S.cell, ...S.collegeStat, justifyContent: "center" }}>
+                <StatStack pts={r.collegePts} dollars={r.collegeDollar} />
+              </div>
+
+              <div style={{ ...S.cell, ...S.proPick }}>
+                <PickCell pick={r.proPick} result={r.proResult} />
+              </div>
+              <div style={{ ...S.cell, ...S.proStat, justifyContent: "center" }}>
+                <StatStack pts={r.proPts} dollars={r.proDollar} />
+              </div>
+
+              <div style={{ ...S.cell, ...S.bonus }}>
+                <div style={S.bonusWrap}>
+                  <div style={S.bonusLabel}>
+                    {r.bonusesLabels.length
+                      ? r.bonusesLabels.map((n, idx) => (
+                          <div key={idx} style={S.bonusName}>{n}</div>
+                        ))
+                      : <span style={{ color: "#94a3b8" }}>—</span>}
+                  </div>
+                  <span style={S.bonusMoney(r.bonusesTotal)}>{fmtMoney(r.bonusesTotal)}</span>
+                </div>
+              </div>
+
+              <div style={{ ...S.cell, ...S.total, justifyContent: "center" }}>
+                <span style={S.totalMoney(r.weekTotal)}>{fmtMoney(r.weekTotal)}</span>
+              </div>
+            </div>
+          ))}
         </div>
-      ))}
+
+        {/* Bonus Summary (derived from picks) */}
+        <div style={{ marginTop: 16 }}>
+          <h3 className="text-lg font-semibold">Bonus Summary</h3>
+          {["DOG","LOY","LOQ","STEAL","PRESS"].map((key) => (
+            <div key={key} style={{ marginTop: 6 }}>
+              <strong>{key}:</strong>{" "}
+              {bonusByType[key]?.length ? bonusByType[key].join(", ") : "—"}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
-
