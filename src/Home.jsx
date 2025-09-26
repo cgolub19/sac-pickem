@@ -29,7 +29,8 @@ const CHAMPIONS = [
 // Edit these paths if your routes differ
 const routes = {
   pickem: "/pickem",
-  live: "/live-picks",
+  live: "/live-picks?v=w5",
+
   grid: "/season-grid",
   weekly: "/weekly-summary",
 

@@ -349,49 +349,41 @@ export default function LivePicks() {
     (async () => {
       setError("");
       // 1) week (auto-advance to NEXT week every Thursday morning)
-const baseSel = "id, number, status, start_date, end_date";
+// 1) Resolve week from week_schedule by dates (Thu→Wed) using LOCAL date
+const todayStr = new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD
 
-// get current (OPEN else latest)
-let { data: wk } = await supabase
-  .from("weeks")
-  .select(baseSel)
-  .eq("status", "OPEN")
-  .order("id", { ascending: false })
+// Pick the latest week whose OPEN date is <= today (prevents falling back to last week on prod)
+let { data, error } = await supabase
+  .from('week_schedule')
+  .select('week_id, number:week_id, start_date:open_at, end_date:close_at')
+  .lte('open_at', todayStr)
+  .order('open_at', { ascending: false })
   .limit(1)
   .maybeSingle();
 
-if (!wk) {
-  const r = await supabase
-    .from("weeks")
-    .select(baseSel)
-    .order("id", { ascending: false })
+
+// if not inside any window, fall forward to the next opening week
+if ((!data || error)) {
+  const res2 = await supabase
+    .from('week_schedule')
+    .select('week_id, number:week_id, start_date:open_at, end_date:close_at')
+    .gt('open_at', todayStr)
+    .order('open_at', { ascending: true })
     .limit(1)
     .maybeSingle();
-  wk = r.data || null;
-}
-if (!wk) {
-  setError("No week found.");
-  return;
+  data = res2.data ?? null;
 }
 
-// if it's Thursday morning (local time), advance to the next week (if any)
-const now = new Date();
-const THURSDAY = 4;   // 0=Sun, 4=Thu
-const SWITCH_HOUR = 6; // after 06:00 local
-const isThursdayMorning = now.getDay() === THURSDAY && now.getHours() >= SWITCH_HOUR;
+if (!data) { setError('No week found.'); return; }
 
-if (isThursdayMorning) {
-  const nextRes = await supabase
-    .from("weeks")
-    .select(baseSel)
-    .gt("id", wk.id)
-    .order("id", { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  if (nextRes.data) wk = nextRes.data;
-}
-
+const wk = {
+  id: data.week_id,
+  number: data.number,
+  start_date: data.start_date,
+  end_date: data.end_date,
+};
 setWeek(wk);
+
 
 
       // 2) window (start-3d .. end+3d) or derive from game_scores if present
@@ -447,20 +439,62 @@ setWeek(wk);
 
     const tick = async () => {
   try {
-    // NFL: last 8 days up to now (most recent completed NFL week)
-    const MS_DAY = 24 * 60 * 60 * 1000;
-    const now = new Date();
-    const nflEnd = now;
-    const nflStart = new Date(now.getTime() - 8 * MS_DAY);
+    
 
-    // NCAA: current window
+
+        // NFL: use the same current window (Thu→Wed) so future games show up
+    const nflStart = windowRange.start;
+// extend the NFL window 2 extra days so Monday Night Football is included
+const nflEnd = new Date(windowRange.end);
+nflEnd.setDate(nflEnd.getDate() + 2);
+
+
     const [nfl, ncaaf] = await Promise.all([
       fetchGamesForLeague({ league: "NFL",  start: nflStart, end: nflEnd }),
       fetchGamesForLeague({ league: "NCAA", start: windowRange.start, end: windowRange.end }),
     ]);
 
+
     if (!alive) return;
-    setGamesIndex(indexGames([...nfl, ...ncaaf]));
+    // Add DB fallback for NFL (when ESPN feed doesn't return upcoming games)
+const { data: dbNFL } = await supabase
+  .from('game_scores')
+  .select('espn_event_id, league, home, away, commence')
+  .eq('week_id', week.id)
+  .ilike('league', 'nfl');
+
+const nflDbFallback = (dbNFL ?? []).map(g => {
+  const iso = new Date(g.commence ?? Date.now()).toISOString();
+  return {
+    id: Number(g.espn_event_id),
+
+    date: iso,
+    league: "NFL",
+    // ESPN-shaped structure so indexGames() can parse it
+    competitions: [{
+      competitors: [
+        {
+          homeAway: "home",
+          team: {
+            displayName: g.home ?? "TBD",
+            abbreviation: (g.home ?? "TBD").toUpperCase().slice(0,3),
+          },
+        },
+        {
+          homeAway: "away",
+          team: {
+            displayName: g.away ?? "TBD",
+            abbreviation: (g.away ?? "TBD").toUpperCase().slice(0,3),
+          },
+        },
+      ],
+    }],
+  };
+});
+;
+
+setGamesIndex(indexGames([...nfl, ...ncaaf, ...nflDbFallback]));
+
   } catch (e) {
     if (!alive) return;
     console.warn("Live feed error", e);
@@ -551,13 +585,12 @@ setWeek(wk);
         .bug .net { font-size:11px; color:#6b7280; }
 
         @media (max-width: 640px) {
-          .legend { display:none; }
-          .row { grid-template-columns: 1fr; }
-          .player { font-size:14px; }
-          .row > .player { order: 0; }
-          .row > .card:nth-child(2) { order: 1; } /* College */
-          .row > .card:nth-child(3) { order: 2; } /* Pro */
-        }
+  .legend { display:none; }
+  .row { grid-template-columns: 1fr 1fr; gap:8px; align-items:start; }
+  .player { font-size:14px; grid-column: 1 / -1; } /* name spans both columns */
+  /* cards render side-by-side: College (left), NFL (right) */
+}
+
       `}</style>
     </div>
   );
